@@ -79,9 +79,19 @@ npm run review -- --manifest=data/jobs/job-01/batch.draft.json
 
 生成文件不会覆盖已有输出。修正后使用新的 paired/draft/decisions/approved 文件名，并将后续命令及哈希引用指向这一版；保留旧草稿和审校证据。
 
+预览按题并排显示真实原图区域和录入内容，并提供逐题 issues、专项问题及覆盖候选的定位链接。修改草稿后可用 `npm run workflow:diff -- --before=<同 job 旧草稿> --after=<同 job 新草稿>` 查看差异与受影响的完整题；不会迁移旧批准。可选的 `workflow:job` 登记实际范围、文件哈希和版本，推导本地阶段，不连接平台或替代上面的基线顺序。具体接口按[本地工具](../../../../docs/workflow-tools.md)。
+
 ## 实际审校与批准
 
 逐题实际查看正文、答案和裁图，并重新核对整题、来源、格式、答案间隔。按[审校规则](../../../../docs/review-rules.md)处理专项项。形成绑定当前草稿字节 SHA256 的 `review-decisions.json`，每题的 evidence 写具体原页/区域及核对结论。没有读图就不能填 `checks: true`。复杂格式或未辨字继续 pending，不伪造线性排版声明。
+
+可先准备默认未通过的模板，再将实际完成的审校决定另存为后续批准使用的文件：
+
+```powershell
+npm run workflow:decisions -- --manifest=data/jobs/job-01/batch.draft.json --output=data/jobs/job-01/review-decisions.template.json
+```
+
+模板带当前草稿哈希、逐题来源引用，四项 checks、coverageChecked 均为 false，evidence 留空。引用只供定位，不代表读图完成。独立复核可重点检查跨页、无编号和配答冲突，由一位材料维护者统一修订；最终仍逐题审校并核对全部覆盖。
 
 ```powershell
 npm run workflow:approve -- --manifest=data/jobs/job-01/batch.draft.json --decisions=data/jobs/job-01/review-decisions.json --output=data/jobs/job-01/batch.approved.json

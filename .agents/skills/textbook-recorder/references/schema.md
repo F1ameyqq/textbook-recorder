@@ -89,6 +89,8 @@
 
 `review-decisions.json` 绑定草稿的原始文件字节 SHA256：
 
+`workflow:decisions` 可生成同 job 的待填写模板，默认 `coverageChecked: false`、四项 checks 全 false、evidence 为空。额外 `sourceReferences` 仅保存定位引用、`referenceOnly: true`，不是检查证据；模板须实际审校填妥后才能通过 approve。修订版本比较和不可变 job 登记见[本地工具](../../../../docs/workflow-tools.md)，不改变这里的执行数据契约。
+
 ```json
 {
   "schemaVersion": 1,

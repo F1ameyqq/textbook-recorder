@@ -27,6 +27,9 @@
     "workflow:crop": "node scripts/run-python-tool.mjs crop",
     "workflow:pair": "node scripts/pair-batch.mjs",
     "workflow:draft": "node scripts/prepare-draft.mjs",
+    "workflow:decisions": "node scripts/create-review-decisions.mjs",
+    "workflow:diff": "node scripts/review-diff.mjs",
+    "workflow:job": "node scripts/workflow-job.mjs",
     "workflow:approve": "node scripts/approve-reviewed-draft.mjs"
   },
   "dependencies": {

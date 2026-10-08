@@ -2,62 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inspectReviewedBatch, renderReviewedBatchPreview, reviewedManifestHash } from '../src/review-preflight.mjs';
-import { writableWorkspacePath } from '../src/recorder-config.mjs';
-
-const inside = (root, candidate) => {
-  const relative = path.relative(root, candidate);
-  return relative === '' || !(relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative));
-};
-
-async function existingAncestor(directory) {
-  let current = directory;
-  while (true) {
-    try { await fs.lstat(current); }
-    catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-      const parent = path.dirname(current);
-      if (parent === current) throw error;
-      current = parent; continue;
-    }
-    // A dangling link is an error, not a missing directory to skip over.
-    return { path: current, realPath: await fs.realpath(current) };
-  }
-}
-
-async function lexicalProjectForCwd(project, cwd) {
-  let current = path.resolve(cwd);
-  while (true) {
-    if (path.relative(project, await fs.realpath(current)) === '') return current;
-    const parent = path.dirname(current);
-    if (parent === current) return project;
-    current = parent;
-  }
-}
-
-async function safeOutputDirectory(project, lexicalProject, requested) {
-  const trustedRoot = path.join(project, 'data', 'review');
-  const lexicalRoot = path.join(lexicalProject, 'data', 'review');
-  if (inside(lexicalRoot, requested)) {
-    requested = path.resolve(trustedRoot, path.relative(lexicalRoot, requested));
-  } else if (!inside(trustedRoot, requested)) {
-    throw new Error('输出目录必须位于项目 data/review 内');
-  }
-  const ancestor = await existingAncestor(requested);
-  if (inside(trustedRoot, ancestor.path)) {
-    if (!inside(trustedRoot, ancestor.realPath)) throw new Error('输出目录软链接/junction 越出 data/review');
-  } else if (path.relative(ancestor.path, ancestor.realPath) !== '') {
-    throw new Error('输出根的祖先软链接/junction 改变了 data/review 真实位置');
-  }
-  await writableWorkspacePath(project, path.join(requested, 'preflight.json'));
-  await fs.mkdir(requested, { recursive: true });
-  const realRoot = await fs.realpath(trustedRoot), realOutput = await fs.realpath(requested);
-  if (path.relative(trustedRoot, realRoot) !== '' || !inside(trustedRoot, realOutput)) {
-    throw new Error('创建后的输出目录真实路径越出 data/review');
-  }
-  await writableWorkspacePath(trustedRoot, path.join(realOutput, 'preflight.json'));
-  await writableWorkspacePath(trustedRoot, path.join(realOutput, 'preview.html'));
-  return realOutput;
-}
+import { reviewOutputDirectory, writeReviewFiles } from '../src/review-output.mjs';
 
 function argumentsFor(argv) {
   const options = {};
@@ -82,21 +27,14 @@ export async function reviewBatch(argv, cwd = process.cwd()) {
   const manifest = JSON.parse(bytes.toString('utf8').replace(/^\uFEFF/u, ''));
   const baseDir = path.dirname(manifestPath), report = inspectReviewedBatch(manifest, baseDir);
   const project = await fs.realpath(path.dirname(path.dirname(fileURLToPath(import.meta.url))));
-  const lexicalProject = await lexicalProjectForCwd(project, cwd);
   const name = path.basename(manifestPath, path.extname(manifestPath)).replace(/[^\p{L}\p{N}_-]/gu, '-');
   const requestedOutput = options.outputdir ? path.resolve(cwd, options.outputdir)
     : path.join(project, 'data', 'review', `${name}-${hash.slice(0, 12)}`);
   const preview = renderReviewedBatchPreview(manifest, baseDir, report);
   const document = { ...report, manifestPath, manifestSha256: hash, generatedAt: new Date().toISOString() };
-  const outputDir = await safeOutputDirectory(project, lexicalProject, requestedOutput);
+  const outputDir = await reviewOutputDirectory(project, cwd, requestedOutput);
   const reportPath = path.join(outputDir, 'preflight.json'), previewPath = path.join(outputDir, 'preview.html');
-  // No existing local evidence is overwritten and the manifest is never edited.
-  for (const file of [reportPath, previewPath]) {
-    try { await fs.access(file); throw new Error(`输出已存在，请选新目录：${file}`); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-  }
-  await fs.writeFile(reportPath, JSON.stringify(document, null, 2) + '\n', { flag: 'wx' });
-  await fs.writeFile(previewPath, preview, { flag: 'wx' });
+  await writeReviewFiles(project, outputDir, { 'preflight.json': JSON.stringify(document, null, 2) + '\n', 'preview.html': preview });
   return { valid: report.valid, readyForExecution: report.readyForExecution, errors: report.errors.length,
     warnings: report.warnings.length, reportPath, previewPath, manifestSha256: hash };
 }

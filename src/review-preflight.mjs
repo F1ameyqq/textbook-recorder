@@ -1,17 +1,19 @@
 import { createHash } from 'node:crypto';
 import { validateNewSystemManifest, renderBlockHtml } from './new-system-core.mjs';
+import { buildReviewDiagnostics, reviewAnchor, reviewText } from './review-issues.mjs';
+import { previewBlock, renderTaskSources, renderReviewDiagnostic, resolvePreviewSourcePages } from './review-preview.mjs';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonempty = value => typeof value === 'string' && value.trim().length > 0;
 const positive = value => Number.isSafeInteger(value) && value > 0;
 const CHECKS = ['sourceText', 'answerMatch', 'wholeQuestion', 'format'];
 const CANDIDATE_TYPES = new Set(['question', 'knowledge-construction', 'whole-activity', 'non-question']);
-const escape = value => String(value ?? '').replace(/&/gu, '&amp;').replace(/</gu, '&lt;')
+const escape = value => reviewText(value).replace(/&/gu, '&amp;').replace(/</gu, '&lt;')
   .replace(/>/gu, '&gt;').replace(/"/gu, '&quot;').replace(/'/gu, '&#39;');
-const textOf = block => Array.isArray(block?.parts) ? block.parts.join('\u00a0'.repeat(8))
-  : Array.isArray(block?.runs) ? block.runs.map(run => String(run?.text ?? '')).join('')
-    : String(block?.text ?? '');
-const missingAnswerLabel = value => /^(?:原书未提供参考答案|无(?:官方)?(?:参考)?答案|未提供(?:参考)?答案|没有(?:参考)?答案)[。.!！]?$/u.test(String(value).trim());
+const textOf = block => Array.isArray(block?.parts) ? block.parts.map(reviewText).join('\u00a0'.repeat(8))
+  : Array.isArray(block?.runs) ? block.runs.map(run => reviewText(run?.text)).join('')
+    : reviewText(block?.text);
+const missingAnswerLabel = value => /^(?:原书未提供参考答案|无(?:官方)?(?:参考)?答案|未提供(?:参考)?答案|没有(?:参考)?答案)[。.!！]?$/u.test(reviewText(value).trim());
 
 function suspiciousFraction(text) {
   // Units are not fractions to be rejected. The remaining matches are only
@@ -160,12 +162,12 @@ export function inspectReviewedBatch(manifest, baseDir = process.cwd()) {
   for (const [id, task] of byId) {
     const mapped = taskPages.get(id);
     if (!mapped || !Array.isArray(task.source?.pages) || task.source.pages.some(page => !mapped.has(page))) {
-      errors.push(`任务 ${String(id)}: 所有正文 source.pages 都须有逐页候选映射，不能只核题数`);
+      errors.push(`任务 ${reviewText(id)}: 所有正文 source.pages 都须有逐页候选映射，不能只核题数`);
     }
   }
   const valid = errors.length === 0;
   const unresolvedSpecialReview = specialReview.filter(risk => !risk.resolved);
-  return {
+  const report = {
     schemaVersion: 1, kind: 'reviewed-batch-preflight', valid, errors, warnings,
     coreValid: core.valid, readyForExecution: valid && unresolvedSpecialReview.length === 0
       && tasks.every(task => task?.review?.status === 'approved'),
@@ -179,39 +181,50 @@ export function inspectReviewedBatch(manifest, baseDir = process.cwd()) {
       'specialReview 确认只记录人工声明及冻结题单绑定，不证明工具已核验原图语义',
       '本报告和预览不会批准题单，也不证明平台保存或实际页面渲染'],
   };
-}
-
-function previewBlock(block, baseDir) {
-  try { return renderBlockHtml(block, baseDir); }
-  catch (error) {
-    // Invalid and unsupported material remains inert text, never raw HTML.
-    return `<p class="invalid">${escape(error.message)}</p><pre>${escape(JSON.stringify(block))}</pre>`;
-  }
+  report.diagnostics = buildReviewDiagnostics(manifest, report);
+  return report;
 }
 
 /** Offline preview with escaped metadata and validated local raster bytes. */
 export function renderReviewedBatchPreview(manifest, baseDir = process.cwd(), report = inspectReviewedBatch(manifest, baseDir)) {
   const tasks = Array.isArray(manifest?.tasks) ? manifest.tasks : [];
   const pages = Array.isArray(manifest?.coverage?.pages) ? manifest.coverage.pages : [];
-  const issues = [...report.errors.map(value => `错误：${value}`), ...report.warnings.map(value => `提示：${value}`)];
-  const originals = pages.filter(object).map(page => `<article class="original"><h3>原书页 ${escape(page.page)}</h3>${page.imagePath
+  const diagnostics = Array.isArray(report.diagnostics) ? [...report.diagnostics] : buildReviewDiagnostics(manifest, report);
+  const rasterCache = new Map(), sourcePages = resolvePreviewSourcePages(manifest, pages, baseDir, rasterCache);
+  if (sourcePages.issue) diagnostics.push({ severity: 'error', code: 'source-index-preview', message: sourcePages.issue,
+    location: { scope: 'batch', path: 'preparation.index' }, anchor: 'batch-top', input: 'index.json / mapping.json',
+    action: '保留实际原图和历史版本，核对同 job 的引用哈希与原图字节；本预览不修复或批准材料。' });
+  const originals = pages.map((page, pageIndex) => !object(page) ? `<article class="original invalid" id="${reviewAnchor({ pageIndex })}"><h3>来源页 ${pageIndex + 1} 结构无效</h3><pre>${escape(JSON.stringify(page))}</pre></article>` : `<article class="original" id="${reviewAnchor({ pageIndex })}"><h3>原书页 ${escape(page.page)}</h3>${page.imagePath
     ? previewBlock({ type: 'image', path: page.imagePath, align: 'center' }, baseDir) : '<p>未附本地原图</p>'}
-    <ul>${(Array.isArray(page.candidates) ? page.candidates : []).filter(object).map(candidate =>
-      `<li>${escape(candidate.id)} · ${escape(candidate.type)} · ${escape(candidate.decision)} → ${escape((Array.isArray(candidate.taskIds) ? candidate.taskIds : []).join(', '))}${candidate.reason ? `：${escape(candidate.reason)}` : ''}</li>`).join('')}</ul></article>`).join('');
-  const taskViews = tasks.filter(object).map(task => {
-    const heading = `${task.target?.chapterLabel ?? ''} / ${task.target?.sectionLabel ?? ''} / 第${task.target?.record ?? '?'}条`;
-    const side = (name, label) => `<section><h3>${label}</h3>${(Array.isArray(task[name]?.blocks) ? task[name].blocks : [])
-      .map(block => previewBlock(block, baseDir)).join('')}</section>`;
-    return `<article class="task"><h2>${escape(heading)}</h2><p class="meta">${escape(task.id)} · 原状态 ${escape(task.review?.status)} · 题页 ${escape(Array.isArray(task.source?.pages) ? task.source.pages.join(', ') : '')} · 答页 ${escape(Array.isArray(task.source?.answerPages) ? task.source.answerPages.join(', ') : '')}</p>
+    <ul>${(Array.isArray(page.candidates) ? page.candidates : []).map((candidate, candidateIndex) => !object(candidate) ? `<li class="invalid" id="${reviewAnchor({ pageIndex, candidateIndex })}">候选结构无效：${escape(JSON.stringify(candidate))}</li>` :
+      `<li id="${reviewAnchor({ pageIndex, candidateIndex })}">${escape(candidate.id)} · ${escape(candidate.type)} · ${escape(candidate.decision)} → ${(Array.isArray(candidate.taskIds) ? candidate.taskIds : []).map(id => {
+        const taskIndex = tasks.findIndex(task => task?.id === id);
+        return taskIndex < 0 ? escape(id) : `<a href="#${reviewAnchor({ taskIndex })}">${escape(id)}</a>`;
+      }).join(', ')}${candidate.reason ? `：${escape(candidate.reason)}` : ''}</li>`).join('')}</ul></article>`).join('');
+  const taskViews = tasks.map((task, taskIndex) => {
+    if (!object(task)) return `<article class="task invalid" id="${reviewAnchor({ taskIndex })}"><h2>任务 ${taskIndex + 1} 结构无效</h2><pre>${escape(JSON.stringify(task))}</pre></article>`;
+    const heading = `${reviewText(task.target?.chapterLabel)} / ${reviewText(task.target?.sectionLabel)} / 第${reviewText(task.target?.record ?? '?')}条`;
+    const side = (name, label) => `<section class="side" id="${reviewAnchor({ taskIndex, side: name })}"><h3>${label}对照</h3><div class="comparison">${renderTaskSources(task, name, taskIndex, sourcePages.pages, baseDir, rasterCache)}<section class="transcription"><h4>${label}录入内容</h4>${(Array.isArray(task[name]?.blocks) ? task[name].blocks : [])
+      .map((block, blockIndex) => `<div class="content-block" id="${reviewAnchor({ taskIndex, side: name, blockIndex })}"><span class="block-label">${name}.blocks[${blockIndex}]</span>${previewBlock(block, baseDir)}</div>`).join('') || '<p class="invalid">缺少内容块</p>'}</section></div></section>`;
+    const taskDiagnostics = diagnostics.filter(diagnostic => diagnostic.location?.taskIndex === taskIndex);
+    const checkDiagnostics = taskDiagnostics.filter(diagnostic => diagnostic.code === 'review-check-pending');
+    const contentDiagnostics = taskDiagnostics.filter(diagnostic => diagnostic.code !== 'review-check-pending');
+    const urgent = contentDiagnostics.some(diagnostic => diagnostic.severity === 'error' || diagnostic.severity === 'review');
+    const checkLabels = [['sourceText', '原文'], ['answerMatch', '答案归属'], ['wholeQuestion', '整题'], ['format', '格式']];
+    return `<article class="task" id="${reviewAnchor({ taskIndex })}"><h2>${escape(heading)}</h2><p class="meta">${escape(task.id)} · 原状态 ${escape(task.review?.status)} · 题页 ${escape(Array.isArray(task.source?.pages) ? task.source.pages.map(reviewText).join(', ') : '')} · 答页 ${escape(Array.isArray(task.source?.answerPages) ? task.source.answerPages.map(reviewText).join(', ') : '')}</p>
       <p>作答依据：${escape(task.answerRequirement?.kind)} — ${escape(task.answerRequirement?.evidence)}；答案状态：${escape(task.answerStatus)}</p>
-      <div class="columns">${side('stem', '题干')}${side('answer', '答案')}</div></article>`;
+      <p class="human-checks">人工检查声明：${checkLabels.map(([key, label]) => `${label} ${task.review?.checks?.[key] === true ? '已声明通过' : task.review?.checks?.[key] === false ? '待确认' : '未声明'}`).join(' · ')}（工具未核验原图语义）</p>
+      ${taskDiagnostics.length ? `<details class="task-diagnostics"${urgent ? ' open' : ''}><summary>本题问题与定位（${contentDiagnostics.length}）${checkDiagnostics.length ? ` · ${checkDiagnostics.length} 项人工检查待确认` : ''}</summary><ul>${contentDiagnostics.map(renderReviewDiagnostic).join('')}</ul>${checkDiagnostics.length ? `<details class="check-details"><summary>展开人工检查说明（${checkDiagnostics.length}）</summary><ul>${checkDiagnostics.map(renderReviewDiagnostic).join('')}</ul></details>` : ''}</details>` : '<p class="meta">未发现结构或元数据问题；仍须实际读图审校。</p>'}
+      <div class="task-sides">${side('stem', '题干')}${side('answer', '答案')}</div><p class="back"><a href="#batch-top">返回批次问题索引</a></p></article>`;
   }).join('');
+  const taskNavigation = tasks.map((task, taskIndex) => `<a href="#${reviewAnchor({ taskIndex })}">${taskIndex + 1} · ${escape(task?.id ?? '无效任务')}</a>`).join('');
+  const errorCount = diagnostics.filter(diagnostic => diagnostic.severity === 'error').length;
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
-<title>离线题单审校预览</title><style>body{font:16px/1.65 system-ui,sans-serif;margin:0;background:#f3f5f7;color:#17202b}main{max-width:1280px;margin:auto;padding:24px}h1,h2,h3{line-height:1.3}.notice{padding:16px;background:#fff4d6;border:1px solid #e2c675}.task,.original{background:white;border:1px solid #d7dee5;padding:18px;margin:20px 0;overflow-wrap:anywhere}.columns{display:grid;grid-template-columns:1fr 1fr;gap:24px}.columns section{min-width:0;padding:12px;border:1px solid #e0e6ed}.columns p{white-space:pre-wrap}.meta{color:#52606d}img{max-width:100%;height:auto}pre{white-space:pre-wrap}.invalid{color:#a01b1b}@media(max-width:760px){.columns{grid-template-columns:1fr}}@media print{body{background:white}.task,.original{break-inside:avoid}.notice{background:white}}</style></head>
-<body><main><h1>离线题单审校预览</h1><p class="notice">只读预览，不自动批准任务。结构校验：${report.valid ? '通过' : '未通过'}；执行准入：${report.readyForExecution ? '元数据检查通过' : '未就绪'}。原图语义与实际平台渲染需独立审校；本页不连接网络、不写平台。</p>
+<title>离线题单审校预览</title><style>body{font:16px/1.65 system-ui,sans-serif;margin:0;background:#f3f5f7;color:#17202b}main{max-width:1480px;margin:auto;padding:24px}h1,h2,h3,h4{line-height:1.3}.notice{padding:16px;background:#fff4d6;border:1px solid #e2c675}.task,.original{background:white;border:1px solid #d7dee5;padding:18px;margin:20px 0;overflow-wrap:anywhere}.comparison{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:24px}.comparison>section{min-width:0;padding:12px;border:1px solid #e0e6ed}.side{margin:24px 0}.comparison p{white-space:pre-wrap}.meta,.block-label{color:#52606d}.block-label{font-size:12px;font-family:ui-monospace,monospace}.content-block{border-bottom:1px solid #e0e6ed;padding:8px 0}img{max-width:100%;height:auto}pre{white-space:pre-wrap}.invalid,.diagnostic.error>a{color:#a01b1b}.diagnostic.review>a{color:#745100}.diagnostic p{margin:3px 0;font-size:14px}.diagnostic{margin:14px 0}.diagnostic-location{color:#52606d}.source-region{margin:12px 0 20px}.source-region figcaption{font-size:13px;color:#52606d;margin-bottom:8px}.region-window{position:relative;overflow:hidden;width:100%;background:#e0e6ed}.region-window img{position:absolute;max-width:none}.full-source summary,.task-diagnostics summary{cursor:pointer}.full-source{margin:10px 0}.original-size{overflow:auto;max-height:720px;background:#edf0f3}.original-size img{display:block;max-width:none}.task-diagnostics{background:#faf6ed;padding:12px}.index-nav,.task-navigation{display:flex;gap:12px;flex-wrap:wrap}.task-navigation{margin:18px 0}.task-navigation a{padding:4px 10px;border:1px solid #ccd8e2;border-radius:4px;background:white}.batch-diagnostics{margin:18px 0;padding:12px;background:white;border:1px solid #d7dee5}.batch-diagnostics summary{cursor:pointer}.check-details{margin-top:10px}a{color:#145b8f}code{overflow-wrap:anywhere}[id]{scroll-margin-top:18px}:target{outline:3px solid #e2a641;outline-offset:4px}.human-checks{font-size:14px}.back{font-size:14px}@media(max-width:760px){main{padding:12px}.comparison{grid-template-columns:1fr}.task,.original{padding:12px}}@media print{body{background:white}.task,.original{break-inside:avoid}.notice{background:white}.back,.full-source{display:none}}</style></head>
+<body><main id="batch-top"><h1>离线题单审校预览</h1><p class="notice">只读预览，不自动批准任务。结构校验：${report.valid ? '通过' : '未通过'}；执行准入：${report.readyForExecution ? '元数据检查通过' : '未就绪'}。原图语义与实际平台渲染需独立审校；本页不连接网络、不写平台。</p>
 <p>书 ${escape(manifest?.bookId)}；${escape(report.summary.tasks)} 条任务；${escape(report.summary.sourcePages)} 页来源。</p>
-<ul>${issues.map(value => `<li>${escape(value)}</li>`).join('')}</ul><h2>逐页原图与覆盖清单</h2>${originals}<h2>题答对照</h2>${taskViews}</main></body></html>`;
+<nav class="index-nav"><a href="#task-comparisons">逐题原图与录入对照</a><a href="#page-coverage">逐页覆盖清单</a></nav><details class="batch-diagnostics"${errorCount ? ' open' : ''}><summary>批次问题索引（${diagnostics.length} 项，${errorCount} 个错误）</summary><ul>${diagnostics.map(renderReviewDiagnostic).join('') || '<li>未发现结构或元数据问题。</li>'}</ul></details><nav class="task-navigation" aria-label="题目导航">${taskNavigation}</nav><h2 id="task-comparisons">逐题原图与录入对照</h2><p class="meta">来源区域仅按已声明 bbox 显示原图字节，不产生新裁图或读图证据。可展开整页查看原像素，也可使用浏览器缩放。</p>${taskViews}<h2 id="page-coverage">逐页原图与覆盖清单</h2>${originals}</main></body></html>`;
 }
 
 export function reviewedManifestHash(manifestBytes) {

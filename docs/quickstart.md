@@ -147,6 +147,8 @@ npm run review -- --manifest=data/jobs/job-01/batch.approved.json
 
 命令输出 `preflight.json` 和离线 `preview.html` 路径，可在本地打开题答对照预览。它们不会修改题单或批准任务。再次运行相同题单时已有输出不会被覆盖，可指定新的 `--outputdir=data/review/下一次复核`。
 
+新版预览可按题查看正文/答案原图区域，点击问题定位到内容块或覆盖候选。`workflow:decisions` 准备默认未通过的审校模板，`workflow:diff` 比较修订草稿，`workflow:job` 管理本地范围与文件版本；接口见[本地工作流工具](workflow-tools.md)。这些入口不连接平台，不继承批准，也不代替真实目录基线。
+
 ## 4. 启动与只读核对
 
 服务尚未启动时，在第一个终端运行：

@@ -18,6 +18,7 @@ description: 在本仓库用 agent 读教材原图、确定整题和参考答案
 - 首次使用、采集、OCR 辅助、读图分题、题单批准和执行：按 [工作流](references/workflow.md)。
 - 写 `records.json`、配对、mapping 或批准决定时：按 [数据接口](references/schema.md)，并读仓库[审校规则](../../../docs/review-rules.md)。
 - 保存超时、结果未知、进度与平台不符：立即按仓库[恢复说明](../../../docs/recovery.md)，保留原题单、进度及检查点。
+- 原图对照、问题定位、审校模板、版本差异和本地任务登记：按仓库[本地工作流工具](../../../docs/workflow-tools.md)。这些辅助不授予平台执行许可，也不代替实际读图或哈希绑定批准。
 
 ## 核心判断
 
