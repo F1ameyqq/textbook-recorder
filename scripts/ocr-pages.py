@@ -160,18 +160,24 @@ def finished_matches(previous, source_hash, configuration_hash, artifacts):
     )
 
 
-def run(args):
-    index_path = args.index.resolve()
+def run(args, project=None):
+    from crop_sources import job_file, safe_path
+    project = Path(project or Path(__file__).resolve().parents[1]).resolve(strict=True)
+    index_path = job_file(project, args.index)
     book_root = index_path.parent
     index = json.loads(index_path.read_text(encoding="utf-8-sig"))
+    if index.get("schemaVersion") != 1 or type(index.get("bookId")) is not int or index["bookId"] <= 0:
+        raise ValueError("Index requires schemaVersion 1 and an explicit positive bookId")
     by_page = {}
     for entry in index.get("pages", []):
-        page = int(entry["systemPage"])
+        page = entry["systemPage"]
+        if type(page) is not int or page <= 0:
+            raise ValueError("Index systemPage must be a positive integer")
         if page in by_page:
             raise ValueError(f"Duplicate systemPage in index: {page}")
         by_page[page] = entry
-    output = (args.output or book_root / "ocr").resolve()
-    model_cache = (args.model_cache or book_root.parent / "ocr-models").resolve()
+    output = safe_path(book_root, (project / args.output) if args.output else book_root / "ocr")
+    model_cache = safe_path(project / "data", (project / args.model_cache) if args.model_cache else project / "data" / "ocr-models")
     versions = package_versions()
     settings = {
         "scriptVersion": SCRIPT_VERSION, "device": "cpu",
@@ -186,12 +192,15 @@ def run(args):
         json.dumps(settings, sort_keys=True).encode("utf-8")
     ).hexdigest()
     journal_path = output / "status.json"
+    safe_path(book_root, journal_path)
     journal = (
         json.loads(journal_path.read_text(encoding="utf-8")) if journal_path.exists()
         else {"schemaVersion": 1, "bookId": index.get("bookId"), "pages": {}}
     )
     if journal.get("schemaVersion") != 1 or not isinstance(journal.get("pages"), dict):
         raise ValueError("Unrecognized OCR status journal")
+    if journal.get("bookId") != index["bookId"]:
+        raise ValueError("OCR journal belongs to a different book")
     journal.setdefault("failureHistory", [])
     jobs = []
     summary = {"selected": args.pages, "skipped": [], "notReady": [], "failed": [], "completed": []}
@@ -224,6 +233,8 @@ def run(args):
             if source_hash != entry.get("sha256"):
                 raise ValueError("Image SHA256 differs from the download index")
             artifacts = artifacts_for(output, page)
+            for artifact in artifacts.values():
+                safe_path(book_root, artifact)
             previous = journal["pages"].get(str(page), {})
             if not args.force and finished_matches(previous, source_hash, configuration_hash, artifacts):
                 summary["skipped"].append(page)
@@ -372,6 +383,8 @@ def main():
     parser.add_argument("--retry-failed", action="store_true", help="Retry explicitly selected previous failures once")
     parser.add_argument("--dry-run", action="store_true", help="Check selection, source hashes and resume state without importing models or writing outputs")
     args = parser.parse_args()
+    if sys.version_info < (3, 11):
+        parser.error("Python 3.11 or newer is required")
     if args.offline and (args.det_model_dir is None or args.rec_model_dir is None):
         parser.error("--offline requires --det-model-dir and --rec-model-dir")
     try:

@@ -4,6 +4,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {NewSystemAdapter} from './new-system-adapter.mjs';
 import {validateNewSystemManifest,createNewSystemRun,runNewSystemBatch,compareNewSystemReadback,reconcileNewSystemRun} from './new-system-core.mjs';
 import {inspectReviewedBatch} from './review-preflight.mjs';
+import {collectSourcePages} from './source-collector.mjs';
 import {validateRecorderConfig,validateRecorderCommand,assertRecorderPage,existingWorkspacePath,existingWorkspaceDirectory,writableWorkspacePath,prepareRuntimeDirectory} from './recorder-config.mjs';
 
 const copy=structuredClone;
@@ -31,6 +32,12 @@ export async function installPersistentBridge({page,config,adapterFactory=option
     return {manifestPath,manifest,baseDir,statePath,state};
   };
   const execute=async(action,args)=>{
+    if(action==='collect'){
+      stage('connecting');const active=await getAdapter();
+      const guardNavigation=async()=>{guard();if(active._busy||active._uncertain||pendingSummary(active))throw new Error('存在未完成编辑或待核对保存，禁止采集导航');};
+      await guardNavigation();stage('collecting-sources');
+      return collectSourcePages({page,root,bookId:validated.bookId,from:args.from,to:args.to,output:args.output??path.join('data/jobs',job.id),guardNavigation,stopRequested:()=>stopping,onProgress:async progress=>{job.progress=progress;}});
+    }
     if(action==='probe'){
       stage('connecting');const active=await getAdapter();
       if(args.inventory){stage('inventory');guard();await page.reload({waitUntil:'domcontentloaded'});await active.guard({waitForEditors:false});const inventoryPath=path.join(dataDir,'jobs',job.id,'inventory.json'),inventory={bookId:validated.bookId,startedAt:new Date().toISOString(),complete:false,scopes:[]};await atomic(root,inventoryPath,inventory);await active.inventory({onScope:async(row,completed,total)=>{guard();inventory.scopes.push(row);await atomic(root,inventoryPath,inventory);job.progress={status:'reading_inventory',completed,total};}});inventory.complete=true;inventory.finishedAt=new Date().toISOString();await atomic(root,inventoryPath,inventory);return {bookId:validated.bookId,writePerformed:false,inventoryPath,scopes:inventory.scopes.length,records:inventory.scopes.reduce((n,row)=>n+row.records.length,0)};}
@@ -73,9 +80,9 @@ export async function installPersistentBridge({page,config,adapterFactory=option
     status:()=>{guard();return {bookId:validated.bookId,job:job?{...copy(job),adapterPhase:adapter?.pendingWrite?.phase??null}:null};},
     pause:()=>{guard();stopping=true;if(job?.running)job.stopRequested=true;return {bookId:validated.bookId,stopRequested:true};},
     start:({id,action,args={}})=>{
-      guard();if(typeof id!=='string'||!/^[A-Za-z0-9_-]{1,80}$/u.test(id))throw new Error('命令 ID 无效');validateRecorderCommand({id,action,args},root);if(!['probe','verify','execute','readback','reconcile'].includes(action))throw new Error('该动作不可作为浏览器任务');if(job?.running)throw new Error('已有任务运行');if(job?.id===id)throw new Error('命令 ID 已使用');
+      guard();if(typeof id!=='string'||!/^[A-Za-z0-9_-]{1,80}$/u.test(id))throw new Error('命令 ID 无效');validateRecorderCommand({id,action,args},root);if(!['probe','collect','verify','execute','readback','reconcile'].includes(action))throw new Error('该动作不可作为浏览器任务');if(job?.running)throw new Error('已有任务运行');if(job?.id===id)throw new Error('命令 ID 已使用');
       stopping=false;job={id,action,running:true,terminal:false,startedAt:new Date().toISOString(),phase:null,phaseTaskId:null,phaseStartedAt:null,timings:[],progress:null};
-      execute(action,args).then(result=>{job.result=result;}).catch(error=>{job.error=clean(error);job.result={uncertain:action==='execute'&&(adapter?.pendingWrite?.status==='pending'||adapter?._uncertain===true),pendingWrite:pendingSummary(adapter)};}).finally(async()=>{stage('terminal');job.finishedAt=new Date().toISOString();try{await atomic(root,path.join(dataDir,'jobs',id,'job-result.json'),{...job,running:false,terminal:true});}catch(error){job.evidenceError=clean(error);job.error??=job.evidenceError;if(action==='execute')job.result={...job.result,uncertain:true,pendingWrite:pendingSummary(adapter)};}job.running=false;job.terminal=true;});
+      execute(action,args).then(result=>{job.result=result;}).catch(error=>{job.error=clean(error);job.result={...(action==='collect'?{...error.collection,writePerformed:false}:{}),uncertain:action==='execute'&&(adapter?.pendingWrite?.status==='pending'||adapter?._uncertain===true),pendingWrite:pendingSummary(adapter)};}).finally(async()=>{stage('terminal');job.finishedAt=new Date().toISOString();try{await atomic(root,path.join(dataDir,'jobs',id,'job-result.json'),{...job,running:false,terminal:true});}catch(error){job.evidenceError=clean(error);job.error??=job.evidenceError;if(action==='execute')job.result={...job.result,uncertain:true,pendingWrite:pendingSummary(adapter)};}job.running=false;job.terminal=true;});
       return {bookId:validated.bookId,id,started:true};
     },
   };

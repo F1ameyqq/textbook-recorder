@@ -3,7 +3,7 @@ import {realpathSync} from 'node:fs';
 import path from 'node:path';
 
 export const PLATFORM_ORIGIN='https://easylearn.baidu.com';
-export const TASK_ACTIONS=['probe','verify','execute','readback','reconcile'];
+export const TASK_ACTIONS=['probe','collect','verify','execute','readback','reconcile'];
 export const CONTROL_ACTIONS=[...TASK_ACTIONS,'pause','close','status'];
 function withinWorkspace(root,candidate,allowRoot=false){
   const relative=path.relative(root,candidate);
@@ -75,9 +75,12 @@ export function validateRecorderCommand(command,root){
   if(!command||typeof command!=='object'||Array.isArray(command)||Object.keys(command).some(key=>!['id','action','args'].includes(key)))throw new Error('只接受固定命令，不允许任意脚本');
   const {action,args={}}=command;
   if(!CONTROL_ACTIONS.includes(action)||!args||typeof args!=='object'||Array.isArray(args))throw new Error('命令或参数无效');
-  const allowed=action==='probe'?['chapterLabel','sectionLabel','inventory','exportRecords']:['status','pause','close'].includes(action)?[]:['manifest','state',...(['execute','verify'].includes(action)?['limit']:['taskId']),...(action==='readback'?['capture']:[]),...(action==='reconcile'?['pendingPath']:[])];
+  const allowed=action==='collect'?['from','to','output']:action==='probe'?['chapterLabel','sectionLabel','inventory','exportRecords']:['status','pause','close'].includes(action)?[]:['manifest','state',...(['execute','verify'].includes(action)?['limit']:['taskId']),...(action==='readback'?['capture']:[]),...(action==='reconcile'?['pendingPath']:[])];
   if(Object.keys(args).some(key=>!allowed.includes(key)))throw new Error('命令参数无效，不接受专项修复或代码参数');
-  if(action==='probe'){
+  if(action==='collect'){
+    if(!Number.isSafeInteger(args.from)||args.from<1||!Number.isSafeInteger(args.to)||args.to<args.from)throw new Error('采集必须明确正整数 from/to 页段');
+    if(args.output!==undefined){const full=workspacePath(root,args.output),jobs=workspacePath(root,'data/jobs');if(!/^[A-Za-z0-9_-]{1,80}$/u.test(path.relative(jobs,full)))throw new Error('采集输出必须是 data/jobs/<job> 目录');}
+  }else if(action==='probe'){
     if(args.inventory!==undefined&&typeof args.inventory!=='boolean'||args.exportRecords!==undefined&&typeof args.exportRecords!=='boolean')throw new Error('盘点参数必须为布尔值');
     if(Boolean(args.chapterLabel)!==Boolean(args.sectionLabel)||args.chapterLabel!==undefined&&(typeof args.chapterLabel!=='string'||!args.chapterLabel.trim()||typeof args.sectionLabel!=='string'||!args.sectionLabel.trim()))throw new Error('单节盘点需完整章/节名称');
     if(args.inventory&&(args.chapterLabel||args.exportRecords)||args.exportRecords&&!args.sectionLabel)throw new Error('盘点参数冲突');

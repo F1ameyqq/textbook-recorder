@@ -1,0 +1,4 @@
+interface:
+  display_name: "教材录入助手"
+  short_description: "引导原图采集、配题审校、录入回读与受约束恢复的完整流程"
+  default_prompt: "请用 $textbook-recorder 完成我指定范围的教材录入，先核对书号、目录范围和追加起点。"

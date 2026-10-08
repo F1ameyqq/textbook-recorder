@@ -1,0 +1,4 @@
+# Optional local CPU OCR; first model initialization may download weights.
+paddlepaddle==3.3.0
+paddleocr==3.7.0
+Pillow==12.1.0

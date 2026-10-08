@@ -1,8 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
-const allowedRoots = new Set(['src', 'scripts', 'tests', 'docs', 'examples', '.github', 'config']);
-const allowedTop = new Set(['README.md', 'NOTICE.md', '.gitignore', '.gitattributes', 'package.json', 'package-lock.json', 'requirements-ocr.txt']);
+const allowedRoots = new Set(['src', 'scripts', 'tests', 'docs', 'examples', '.github', '.agents', 'config']);
+const allowedTop = new Set(['README.md', 'NOTICE.md', '.gitignore', '.gitattributes', 'package.json', 'package-lock.json', 'requirements-ocr.txt', 'requirements-crop.txt']);
 const ignoredRoots = new Set(['.git', 'node_modules', 'data', 'profiles', 'imports', 'artifacts', 'screenshots', '__pycache__']);
 const sensitiveNames = /(?:control\.json|session\.json|recorder\.json|\.dpapi\.json|\.env(?:\..*)?|\.log|\.lock|\.tmp|\.zip|\.pyc)$/iu;
 const patterns = [

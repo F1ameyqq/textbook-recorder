@@ -98,7 +98,8 @@ export class PersistentRecorderSession{
     if(action==='status')return this.status({connect:true});if(action==='pause')return this.bridge('pause');if(action==='close'){await this.close();return {bookId:this.bookId,closed:true};}
     if(this.busy||this.state.pending)throw new Error('已有任务或命令尚未终止');this.busy=true;
     try{
-      const context=action!=='probe'?await this.reviewedContext(args):null;
+      const context=!['probe','collect'].includes(action)?await this.reviewedContext(args):null;
+      if(action==='collect'&&this.state.writeBlocked)throw new Error('保存结果待核对；保留写入锁，禁止切换来源页采集');
       if(action==='execute'&&this.state.writeBlocked)throw new Error('保存结果待核对；保留写入锁，禁止再次新增');
       if(action==='reconcile'&&this.state.writeBlocked){await this.bindUnknownRecovery();const blocked=this.state.blockedContext,pendingPath=blocked.pendingPath?await writableWorkspacePath(this.root,args.pendingPath??blocked.pendingPath):null;if(context.manifest!==blocked.manifest||context.state!==blocked.state||context.manifestSha256!==blocked.manifestSha256||args.taskId!==blocked.taskId||blocked.pendingPath&&pendingPath!==blocked.pendingPath)throw new Error('只能核对原失败题单/进度/任务');if(blocked.pendingPath)args.pendingPath=pendingPath;}
       const id=command.id??randomUUID();if(this.state.seenIds.includes(id))throw new Error('命令 ID 已使用，禁止重复派发');

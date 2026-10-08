@@ -1,8 +1,27 @@
-# 教材录入助手 · v0.2.0
+# 教材录入助手 · v0.3.0
 
-把已经对照原书审校的 JSON 题单，按指定书籍和目录顺序追加到录入平台。执行器逐题检查保存回执，并刷新回读题干、答案、来源页和图片；遇到差异或保存结果未知就停止。
+让朋友的 agent 在仓库中完成原页采集、读图分题、答案配对、题单审校和指定范围的追加录入。CLI 负责机械步骤：保留来源与哈希、生成待审草稿、检查批准决定，以及逐题核对保存回执和刷新回读。遇到差异或保存结果未知就停止。
 
-题目拆分、答案对应和原书覆盖需要人工或模型辅助审校。执行阶段不调用模型。本项目提供半自动工作流，尚未完成新书、其他电脑及完整安装流程的实际验收，不能据此承诺全自动或无人值守完成整本书。
+题目拆分、答案对应和原书覆盖由 agent 对照原图判断，也可以人工复核。机械执行不调用模型，但 agent 读图和判断仍消耗其额度。本项目提供 agent 辅助的完整操作流程；采集及新书、新电脑的安装到录入流程仍需实际验收，不能据此承诺零额度、全自动或无人值守完成整本书。
+
+## 让 agent 使用 skill
+
+先取得完整仓库，再以仓库根作为 agent 工作目录。支持仓库 skill 发现的 agent 可调用 `$textbook-recorder`；未出现在列表时，可明确要求读取 [.agents/skills/textbook-recorder/SKILL.md](.agents/skills/textbook-recorder/SKILL.md)。其他 agent 也可显式读取该文件，使用自己的 shell 和本地读图工具按工作流操作，不需要相同的 CUA 插件。
+
+给 agent 的任务可以写成：
+
+```text
+请使用 $textbook-recorder，处理我指定的书号和章节起止范围。
+先核对书号连接，在空编辑器时采集原图，再导出范围内的目录基线，
+按原图准备、审校并追加该范围，
+最后提供保存回读与逐页覆盖报告。范围缺项一次向我确认。
+```
+
+用户可一次授权明确范围内的追加，agent 在范围内接续完成，不逐题重复确认。未知保存、删除或重建不自动扩入范围。缺参考答案如何处理也要沿用本次明确规则，不能套用别人的历史授权。
+
+skill 依赖本仓库程序和参考文件；单独复制 `SKILL.md` 不构成安装。详细机械接口见[工作流](.agents/skills/textbook-recorder/references/workflow.md)和[数据接口](.agents/skills/textbook-recorder/references/schema.md)。
+
+仓库 skill 目录采用 Codex 的 `.agents/skills` 约定；发现和调用方式见 [OpenAI 官方说明](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills)。
 
 ## 当前范围
 
@@ -19,6 +38,8 @@
 ## 环境与第一次使用
 
 需要 Node.js 22 或更高版本、Windows、Edge、已登录的目标录入页面及 [Playwright 浏览器扩展](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm)（[官方安装说明](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md)）。项目固定使用 `@playwright/mcp@0.0.83`；通过锁文件安装依赖。
+
+裁图和可选 CPU OCR 使用 Python，建议 Python 3.11 的项目 `.venv-workflow`；依赖按仓库 `requirements-crop.txt` 或 `requirements-ocr.txt` 安装。初始化方式见[快速开始](docs/quickstart.md)。不用 OCR 也须用 agent 实际读图完成审校。
 
 先接受私有仓库邀请，再从仓库页克隆或选择 **Code → Download ZIP**，解压后进入项目目录。克隆地址为 `https://github.com/F1ameyqq/textbook-recorder.git`，访问需要自己的受邀 GitHub 账号。
 
@@ -58,7 +79,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/setup-extension-
 ## 常用命令
 
 ```powershell
-npm run review -- --manifest=data/jobs/batch.json
+npm run review -- --manifest=data/jobs/job-01/batch.approved.json
 npm run recorder:service
 ```
 
@@ -67,11 +88,13 @@ npm run recorder:service
 ```powershell
 npm run recorder:status
 npm run recorder:probe
-npm run recorder:verify -- --manifest=data/jobs/batch.json --state=data/jobs/progress.json
-npm run recorder:execute -- --manifest=data/jobs/batch.json --state=data/jobs/progress.json --limit=20
+npm run recorder:verify -- --manifest=data/jobs/job-01/batch.approved.json --state=data/jobs/job-01/progress.json --limit=20
+npm run recorder:execute -- --manifest=data/jobs/job-01/batch.approved.json --state=data/jobs/job-01/progress.json --limit=20
 npm run recorder:pause
 npm run recorder:stop
 ```
+
+普通 `probe` 只核对书号与连接，`recordCount: null` 不是目录基线。需采集原图时，先在两编辑器原本为空时 `collect`，再运行带 `chapterLabel`、`sectionLabel`、`exportRecords: true` 参数文件的单节 `probe`；后者会选择已有题目并使编辑器非空。基线导出后按 `recordCount + 1` 准备 mapping。以上 verify/execute 用于材料和基线已准备好的题单；完整顺序见[工作流](.agents/skills/textbook-recorder/references/workflow.md)。
 
 `execute` 默认最多处理 20 条。达到上限后的正常 `stopped` 不等于失败；确认 `pending` 为空、`writeBlocked` 为 `false`、无错误且已处理题目回读通过后，可用同一题单和进度路径再次执行接续。整批只读核对应显式设置足够的 `--limit`，详见快速开始。命令返回任务标识不等于录入完成；以状态中的终止结果、逐题保存证据和刷新回读为准。执行时保持目标页面可用，不在同一页面手动编辑。
 

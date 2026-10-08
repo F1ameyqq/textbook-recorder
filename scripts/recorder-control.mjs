@@ -13,7 +13,7 @@ export async function recorderRequest(root,command,{configPath='config/recorder.
 }
 export async function main(argv=process.argv.slice(2),{root=defaultRoot,log=console.log}={}){
   const positional=[],options={configPath:'config/recorder.json'};for(const argument of argv){if(argument.startsWith('--config='))options.configPath=argument.slice(9);else positional.push(argument);}
-  if(positional.length>2)throw new Error('用法：recorder-control.mjs status|connect-status|probe|pause|close|readback|reconcile [args.json]');
+  if(positional.length>2)throw new Error('用法：recorder-control.mjs status|connect-status|probe|collect|pause|close|readback|reconcile [args.json]');
   const [requested='status',argsPath]=positional,action=requested==='connect-status'?'status':requested,args=argsPath?JSON.parse(await fs.readFile(await existingWorkspacePath(root,argsPath),'utf8')):{};
   // A POST status explicitly requests the initial browser connection; GET does not.
   const config=await loadRecorderConfig(root,options.configPath),control=JSON.parse(await fs.readFile(await existingWorkspacePath(root,'data/persistent-executor/control.json'),'utf8'));
