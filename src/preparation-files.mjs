@@ -55,7 +55,10 @@ export async function readJobJson(root, requested) {
 
 export async function writeJobJson(root, requested, value, baseDir) {
   const job = await preparationJob(root, requested, { create: true });
-  if (baseDir !== undefined && job.baseDir !== baseDir) throw new Error('input/mapping/output 必须位于同一 data/jobs/<job>/ 根');
+  // Windows short paths and project junction aliases can name the same job.
+  // Output clamping above remains lexical and physical; only compare the
+  // already-existing input base directory by its canonical real path.
+  if (baseDir !== undefined && job.baseDir !== await fs.realpath(baseDir)) throw new Error('input/mapping/output 必须位于同一 data/jobs/<job>/ 根');
   // Recheck after mkdir; opening with wx rejects files and dangling links alike.
   await writableWorkspacePath(job.baseDir, job.file);
   const bytes = Buffer.from(JSON.stringify(value, null, 2) + '\n');

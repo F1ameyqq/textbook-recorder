@@ -186,13 +186,23 @@ test('relative CLI flags through an actual project junction alias retain canonic
   try { await fs.symlink(f.project,alias,process.platform==='win32'?'junction':'dir'); }
   catch(error) { if(process.platform==='win32'&&['EPERM','EACCES'].includes(error.code)) { t.skip('Windows 无权创建实际 junction');return; } throw error; }
   t.after(()=>fs.unlink(alias));
+  const canonicalBase=await fs.realpath(f.baseDir);
   await fs.writeFile(path.join(f.baseDir,'records.json'),JSON.stringify(f.input));
   const result=await pairBatch(['--input=data/jobs/synthetic/records.json','--output=data/jobs/synthetic/alias-paired.json'],{project:f.project,cwd:alias});
-  assert.equal(path.dirname(result.outputPath),f.baseDir);
+  assert.equal(path.dirname(result.outputPath),canonicalBase);
   const absolute=await pairBatch(['--input',path.join(alias,'data','jobs','synthetic','records.json'),'--output',path.join(alias,'data','jobs','synthetic','absolute-paired.json')],{project:f.project,cwd:alias});
-  assert.equal(path.dirname(absolute.outputPath),f.baseDir);
+  assert.equal(path.dirname(absolute.outputPath),canonicalBase);
   const lexical=await preparationJob(alias,path.join(alias,'data','jobs','synthetic','other.json'),{create:true});
-  assert.equal(lexical.baseDir,f.baseDir);
+  assert.equal(lexical.baseDir,canonicalBase);
+  // A physically identical baseDir alias is accepted, rather than only a
+  // canonical baseDir returned by readJobJson. A different job stays rejected.
+  const aliasBase=path.join(alias,'data','jobs','synthetic');
+  const written=await writeJobJson(f.project,'data/jobs/synthetic/alias-write.json',{viaAlias:true},aliasBase);
+  assert.equal(path.dirname(written.file),canonicalBase);
+  assert.deepEqual((await readJobJson(f.project,'data/jobs/synthetic/alias-write.json')).value,{viaAlias:true});
+  await fs.mkdir(path.join(f.project,'data','jobs','other'));
+  await assert.rejects(writeJobJson(f.project,'data/jobs/other/alias-cross-job.json',{},aliasBase),/同一/);
+  await assert.rejects(fs.access(path.join(f.project,'data','jobs','other','alias-cross-job.json')),/ENOENT/);
 });
 
 test('input image and JSON symlinks cannot escape the job',async t=>{
