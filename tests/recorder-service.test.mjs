@@ -14,12 +14,12 @@ const BOOK=101,copy=structuredClone;
 async function workspace(t){const root=await fs.mkdtemp(path.join(os.tmpdir(),'recorder-share-test-'));t.after(async()=>{assert.equal(path.dirname(root),path.resolve(os.tmpdir()));assert.ok(path.basename(root).startsWith('recorder-share-test-'));await fs.rm(root,{recursive:true,force:true});});return root;}
 function manifest(){return {schemaVersion:1,kind:'new-system-batch',bookId:BOOK,source:'production',tasks:[1,2].map(record=>({id:'synthetic-'+record,target:{chapterLabel:'合成章',sectionLabel:'合成节',record},source:{pages:[1],answerPages:[9]},stem:{blocks:[{type:'text',text:'求甲乙两量的和。'+record}]},answer:{blocks:[{type:'text',parts:['2','3']}]},answerRequirement:{kind:'question',evidence:'求甲乙两量的和。'},answerStatus:'provided',review:{status:'approved',issues:[],checks:{sourceText:true,answerMatch:true,wholeQuestion:true,format:true}}})),coverage:{pages:[{page:1,candidates:[1,2].map(record=>({id:'candidate-'+record,type:'question',decision:'include',taskIds:['synthetic-'+record]}))}]}};}
 async function putManifest(root,value=manifest()){await fs.mkdir(path.join(root,'data'),{recursive:true});await fs.writeFile(path.join(root,'data/batch.json'),JSON.stringify(value));return {manifest:'data/batch.json',state:'data/run.json'};}
-async function fakeSession(t,{handleStart,failTransport=false}={}){
-  const root=await workspace(t),args=await putManifest(root),starts=[],connections=[];let job=null,live=new Set(),connects=0;
+async function fakeSession(t,{handleStart,failTransport=false,root:workspaceRoot}={}){
+  const root=workspaceRoot??await workspace(t),canonicalRoot=await fs.realpath(root),args=await putManifest(root),starts=[],connections=[];let job=null,live=new Set(),connects=0;
   const connect=async()=>{connects++;const callbacks=[];const servicePid=60000+connects;live.add(servicePid);const connection={servicePid,authConfigured:true,onClosed:fn=>callbacks.push(fn),disconnect:()=>callbacks.forEach(fn=>fn()),close:async()=>{live.delete(servicePid);callbacks.forEach(fn=>fn());},client:{listTools:async()=>({tools:[{name:'browser_tabs',inputSchema:{properties:{action:{enum:['list','select']}}}},{name:'browser_run_code_unsafe',inputSchema:{properties:{code:{type:'string'}}}}]}),callTool:async({name,arguments:input})=>{
     if(name==='browser_tabs')return {structuredContent:input.action==='list'?{tabs:[{index:0,url:recorderBookUrl(BOOK)}]}:{bookId:BOOK}};
     const match=input.code.match(/page\.__persistentRecorder\.(\w+)\((.*)\); \}/u);assert.ok(match);if(match[1]==='status')return {structuredContent:{bookId:BOOK,job:copy(job)}};if(match[1]==='pause')return {structuredContent:{bookId:BOOK,stopRequested:true}};
-    const command=JSON.parse(match[2]);starts.push(command);if(failTransport)throw new Error('transport result lost');job={id:command.id,action:command.action,running:true,terminal:false};const result=handleStart?await handleStart(command,root):{bookId:BOOK,uncertain:false};if(result!==undefined)job={...job,running:false,terminal:true,result};return {structuredContent:{bookId:BOOK,id:command.id,started:true}};
+    const command=JSON.parse(match[2]);starts.push(command);if(failTransport)throw new Error('transport result lost');job={id:command.id,action:command.action,running:true,terminal:false};const result=handleStart?await handleStart(command,canonicalRoot):{bookId:BOOK,uncertain:false};if(result!==undefined)job={...job,running:false,terminal:true,result};return {structuredContent:{bookId:BOOK,id:command.id,started:true}};
   }}};connections.push(connection);return connection;};
   const session=new PersistentRecorderSession({root,bookId:BOOK,connect,alive:pid=>live.has(pid),resolveAuth:async()=>({authConfigured:true})});await session.initialize();return {root,args,session,starts,connections,get connects(){return connects;},setJob:value=>{job=value;}};
 }
@@ -57,6 +57,24 @@ test('a bound successful readonly reconciliation unlocks, incomplete proof does 
   let complete=false;const fake=await fakeSession(t,{handleStart:async(command,root)=>command.action==='execute'?{bookId:BOOK,uncertain:true,pendingWrite:{task:{id:'synthetic-1'}}}:{bookId:BOOK,taskId:'synthetic-1',manifestPath:path.join(root,'data/batch.json'),statePath:path.join(root,'data/run.json'),writePerformed:false,uncertain:false,recovery:{outcome:'saved',writeUnlocked:complete,taskId:'synthetic-1',bookId:BOOK,priorRecordsUnchanged:true,targetRecordUnique:true,fullContentCompared:true,recordId:1001}}});
   await fake.session.command({action:'execute',args:fake.args});await fake.session.command({action:'reconcile',args:{...fake.args,taskId:'synthetic-1'}});assert.equal(fake.session.state.writeBlocked,true);
   complete=true;await fake.session.command({action:'reconcile',args:{...fake.args,taskId:'synthetic-1'}});assert.equal(fake.session.state.writeBlocked,false);await fake.session.close();
+});
+test('a root-junction session unlocks only after complete canonical readonly reconciliation',async t=>{
+  const parent=await workspace(t),actual=path.join(parent,'actual'),alias=path.join(parent,'root-alias');await fs.mkdir(actual);
+  await fs.symlink(actual,alias,process.platform==='win32'?'junction':'dir');
+  const canonicalRoot=await fs.realpath(actual),receivedRoots=[];let complete=false;
+  const fake=await fakeSession(t,{root:alias,handleStart:async(command,root)=>{
+    receivedRoots.push(root);
+    return command.action==='execute'?{bookId:BOOK,uncertain:true,pendingWrite:{task:{id:'synthetic-1'}}}:{bookId:BOOK,taskId:'synthetic-1',manifestPath:path.join(root,'data/batch.json'),statePath:path.join(root,'data/run.json'),writePerformed:false,uncertain:false,recovery:{outcome:'saved',writeUnlocked:complete,taskId:'synthetic-1',bookId:BOOK,priorRecordsUnchanged:true,targetRecordUnique:true,fullContentCompared:true,recordId:1001}};
+  }});
+  assert.equal(fake.session.root,path.resolve(alias));
+  await fake.session.command({action:'execute',args:fake.args});assert.equal(fake.session.state.writeBlocked,true);
+  assert.equal(fake.session.state.blockedContext.manifest,path.join(canonicalRoot,'data/batch.json'));
+  assert.equal(fake.session.state.blockedContext.state,path.join(canonicalRoot,'data/run.json'));
+  await fake.session.command({action:'reconcile',args:{...fake.args,taskId:'synthetic-1'}});assert.equal(fake.session.state.writeBlocked,true);
+  complete=true;await fake.session.command({action:'reconcile',args:{...fake.args,taskId:'synthetic-1'}});
+  assert.equal(fake.session.state.writeBlocked,false);assert.equal(fake.session.state.blockedContext,null);
+  assert.deepEqual(receivedRoots,[canonicalRoot,canonicalRoot,canonicalRoot]);
+  assert.equal(fake.starts.length,3);await fake.session.close();
 });
 test('transport timeout retains the exact pending command and never dispatches it again',async t=>{
   const fake=await fakeSession(t,{failTransport:true}),result=await fake.session.command({id:'lost-result',action:'execute',args:fake.args});assert.equal(result.writeBlocked,true);assert.equal(result.pending.id,'lost-result');
