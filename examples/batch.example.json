@@ -1,0 +1,264 @@
+{
+  "schemaVersion": 1,
+  "kind": "new-system-batch",
+  "bookId": 100001,
+  "source": "fixture",
+  "notes": [
+    "完全合成的离线演练样例，不对应真实书籍；fixture 禁止写入生产平台。"
+  ],
+  "tasks": [
+    {
+      "id": "demo-diagram",
+      "target": {
+        "chapterLabel": "合成演练章",
+        "sectionLabel": "第1节 录入演练",
+        "record": 1
+      },
+      "source": {
+        "pages": [
+          1
+        ],
+        "answerPages": [
+          2
+        ]
+      },
+      "answerRequirement": {
+        "kind": "question",
+        "evidence": "选择图中左侧色块的颜色"
+      },
+      "answerStatus": "provided",
+      "review": {
+        "status": "approved",
+        "issues": [],
+        "checks": {
+          "sourceText": true,
+          "answerMatch": true,
+          "wholeQuestion": true,
+          "format": true
+        }
+      },
+      "stem": {
+        "blocks": [
+          {
+            "type": "text",
+            "text": "1. 图中左侧色块的颜色是（　）"
+          },
+          {
+            "type": "image",
+            "path": "assets/demo-diagram.png",
+            "align": "center",
+            "purpose": "diagram"
+          },
+          {
+            "type": "text",
+            "text": "A. 蓝色\nB. 橙色"
+          }
+        ]
+      },
+      "answer": {
+        "blocks": [
+          {
+            "type": "text",
+            "text": "A"
+          }
+        ]
+      }
+    },
+    {
+      "id": "demo-knowledge",
+      "target": {
+        "chapterLabel": "合成演练章",
+        "sectionLabel": "第1节 录入演练",
+        "record": 2
+      },
+      "source": {
+        "pages": [
+          1
+        ],
+        "answerPages": [
+          2
+        ]
+      },
+      "answerRequirement": {
+        "kind": "fill-in",
+        "evidence": "请填写两处单位换算空白"
+      },
+      "answerStatus": "provided",
+      "review": {
+        "status": "approved",
+        "issues": [],
+        "checks": {
+          "sourceText": true,
+          "answerMatch": true,
+          "wholeQuestion": true,
+          "format": true
+        }
+      },
+      "stem": {
+        "blocks": [
+          {
+            "type": "text",
+            "text": "知识建构：请填写 1 km＝______ m；1 h＝______ min。"
+          }
+        ]
+      },
+      "answer": {
+        "blocks": [
+          {
+            "type": "text",
+            "parts": [
+              "1000",
+              "60"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "demo-whole-activity",
+      "target": {
+        "chapterLabel": "合成演练章",
+        "sectionLabel": "第1节 录入演练",
+        "record": 3
+      },
+      "source": {
+        "pages": [
+          1
+        ],
+        "answerPages": [
+          2
+        ]
+      },
+      "answerRequirement": {
+        "kind": "question",
+        "evidence": "完整活动包含两个需要作答的小问，保留为一题"
+      },
+      "answerStatus": "provided",
+      "review": {
+        "status": "approved",
+        "issues": [],
+        "checks": {
+          "sourceText": true,
+          "answerMatch": true,
+          "wholeQuestion": true,
+          "format": true
+        }
+      },
+      "stem": {
+        "blocks": [
+          {
+            "type": "text",
+            "text": "2. 完整活动：比较两个色块。\n（1）左侧是什么颜色？\n（2）右侧是什么颜色？"
+          }
+        ]
+      },
+      "answer": {
+        "blocks": [
+          {
+            "type": "text",
+            "parts": [
+              "（1）蓝色",
+              "（2）橙色"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "demo-open-question",
+      "target": {
+        "chapterLabel": "合成演练章",
+        "sectionLabel": "第1节 录入演练",
+        "record": 4
+      },
+      "source": {
+        "pages": [
+          1
+        ],
+        "answerPages": [
+          2
+        ]
+      },
+      "answerRequirement": {
+        "kind": "question",
+        "evidence": "请提出两条减少用水浪费的具体建议"
+      },
+      "answerStatus": "not-provided",
+      "review": {
+        "status": "approved",
+        "issues": [],
+        "checks": {
+          "sourceText": true,
+          "answerMatch": true,
+          "wholeQuestion": true,
+          "format": true
+        }
+      },
+      "stem": {
+        "blocks": [
+          {
+            "type": "text",
+            "text": "3. 请提出两条减少用水浪费的具体建议。"
+          }
+        ]
+      },
+      "answer": {
+        "blocks": [
+          {
+            "type": "text",
+            "text": "原书未提供参考答案"
+          }
+        ]
+      }
+    }
+  ],
+  "coverage": {
+    "pages": [
+      {
+        "page": 1,
+        "imagePath": "assets/demo-diagram.png",
+        "candidates": [
+          {
+            "id": "candidate-diagram",
+            "type": "question",
+            "decision": "include",
+            "taskIds": [
+              "demo-diagram"
+            ]
+          },
+          {
+            "id": "candidate-knowledge",
+            "type": "knowledge-construction",
+            "decision": "include",
+            "taskIds": [
+              "demo-knowledge"
+            ]
+          },
+          {
+            "id": "candidate-activity",
+            "type": "whole-activity",
+            "decision": "include",
+            "taskIds": [
+              "demo-whole-activity"
+            ]
+          },
+          {
+            "id": "candidate-open",
+            "type": "question",
+            "decision": "include",
+            "taskIds": [
+              "demo-open-question"
+            ]
+          },
+          {
+            "id": "candidate-explanation",
+            "type": "non-question",
+            "decision": "exclude",
+            "taskIds": [],
+            "reason": "仅课堂目标、展示和评价说明，没有独立作答要求"
+          }
+        ]
+      }
+    ]
+  }
+}

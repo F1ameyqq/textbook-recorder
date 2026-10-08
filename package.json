@@ -1,0 +1,30 @@
+{
+  "name": "textbook-recorder-local",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "本地题单审校、离线演练和百度教育新系统录入执行器",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "configure": "node scripts/configure.mjs",
+    "demo": "node scripts/demo.mjs",
+    "review": "node scripts/review-batch.mjs",
+    "check:share": "node scripts/check-share.mjs",
+    "recorder:service": "node scripts/run-recorder-service.mjs",
+    "recorder:status": "node scripts/recorder-control.mjs status",
+    "recorder:probe": "node scripts/recorder-control.mjs probe",
+    "recorder:verify": "node scripts/run-reviewed-batch-service.mjs --action=verify",
+    "recorder:execute": "node scripts/run-reviewed-batch-service.mjs --action=execute",
+    "recorder:pause": "node scripts/recorder-control.mjs pause",
+    "recorder:stop": "node scripts/recorder-control.mjs close",
+    "recorder:readback": "node scripts/recorder-control.mjs readback",
+    "recorder:recover": "node scripts/recorder-control.mjs reconcile"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@playwright/mcp": "0.0.83",
+    "playwright": "1.58.0"
+  }
+}
