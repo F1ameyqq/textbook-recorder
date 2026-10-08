@@ -18,7 +18,9 @@
 
 ## 环境与第一次使用
 
-需要 Node.js 22 或更高版本、Windows、Edge、已登录的目标录入页面及 Playwright 浏览器扩展。项目固定使用 `@playwright/mcp@0.0.83`；通过锁文件安装依赖。
+需要 Node.js 22 或更高版本、Windows、Edge、已登录的目标录入页面及 [Playwright 浏览器扩展](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm)（[官方安装说明](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md)）。项目固定使用 `@playwright/mcp@0.0.83`；通过锁文件安装依赖。
+
+先接受私有仓库邀请，再从仓库页克隆或选择 **Code → Download ZIP**，解压后进入项目目录。克隆地址为 `https://github.com/F1ameyqq/textbook-recorder.git`，访问需要自己的受邀 GitHub 账号。
 
 在项目目录打开 PowerShell：
 
@@ -27,6 +29,8 @@ npm ci
 npm run doctor
 npm run demo
 ```
+
+如果 PowerShell 提示禁止运行 `npm.ps1`，将命令中的 `npm` 换成 `npm.cmd`；无需修改全局执行策略。
 
 一书使用一份独立工作目录；不要在已有进度的目录里改书号切换到另一书。旧配置、会话和证据保留，另一书从新的仓库副本开始配置。
 
@@ -39,7 +43,7 @@ $bookId = Read-Host '输入本次负责的书号'
 npm run configure -- "--book-id=$bookId"
 ```
 
-配置命令不会覆盖已有文件。然后配置自己的扩展令牌：
+配置命令不会覆盖已有文件。首次令牌尚未配置时，在一个终端运行 `npm run recorder:service`，第二个项目终端运行 `npm run recorder:probe`。保持弹出的扩展 Welcome 页打开，先复制 `PLAYWRIGHT_MCP_EXTENSION_TOKEN=` 后的令牌值，在第三个空闲项目终端配置自己的令牌；前两个终端正在运行或等待，不能用于输入配置命令：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/setup-extension-auth.ps1
@@ -47,7 +51,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/setup-extension-
 
 令牌通过本地隐藏输入保存，使用 Windows DPAPI 加密；不要发到聊天、提交 Git 或复制给朋友。每台电脑、每个 Windows 用户各自配置。`doctor` 和 `demo` 不写入平台。
 
-配置后再运行 `npm run doctor` 检查准备情况。
+令牌导入后，回到 Welcome 页允许本次连接并选择正确的录入标签页。用 `npm run recorder:status` 等待初次连接任务终止，再运行 `npm run recorder:stop`，重新启动 `npm run recorder:service` 使令牌生效。再运行 `npm run doctor` 和 `npm run recorder:probe` 检查准备情况。已有可用本机令牌时可直接启动服务。
 
 [快速开始](docs/quickstart.md)说明连接、审校、执行及关闭步骤。先完成离线演练和只读核对，再录入自己的小批题单。
 

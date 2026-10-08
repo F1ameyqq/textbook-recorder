@@ -278,6 +278,24 @@ test('CLI rejects a lexical output escape before creating any directory', async 
   await assert.rejects(fs.access(outside), { code: 'ENOENT' });
 });
 
+test('CLI accepts explicit data/review output through an actual project-root alias', async t => {
+  const dir = await workspace(t), output = await outputWorkspace(t), file = path.join(dir, 'batch.json');
+  await fs.writeFile(file, JSON.stringify(fixture()));
+  const alias = path.join(dir, 'project-alias');
+  if (!await directoryLink(t, PROJECT, alias)) return;
+  const relativeOutput = path.relative(PROJECT, output);
+  const result = await reviewBatch(['--manifest', file, '--outputdir', relativeOutput], alias);
+  assert.equal(result.valid, true);
+  assert.equal(result.reportPath, path.join(await fs.realpath(output), 'preflight.json'));
+  assert.equal(result.previewPath, path.join(await fs.realpath(output), 'preview.html'));
+  assert.equal(await fs.realpath(alias), await fs.realpath(PROJECT));
+  const outsideLink = path.join(output, 'outside-link');
+  if (!await directoryLink(t, dir, outsideLink)) return;
+  await assert.rejects(reviewBatch(['--manifest', file, '--outputdir',
+    path.join(relativeOutput, 'outside-link', 'uncreated')], alias), /junction|软链接/u);
+  await assert.rejects(fs.access(path.join(dir, 'uncreated')), { code: 'ENOENT' });
+});
+
 test('CLI rejects an actual symlink/junction ancestor escaping the trusted output root', async t => {
   const dir = await workspace(t), output = await outputWorkspace(t), file = path.join(dir, 'batch.json');
   await fs.writeFile(file, JSON.stringify(fixture()));

@@ -4,7 +4,14 @@
 
 ## 1. 安装与离线演练
 
-安装 Node.js 22 或更高版本，取得仓库后在项目目录打开 PowerShell：
+安装 Node.js 22 或更高版本。先接受负责人发来的私有 GitHub 仓库邀请，用自己的受邀账号访问仓库。可以克隆：
+
+```powershell
+git clone https://github.com/F1ameyqq/textbook-recorder.git
+Set-Location textbook-recorder
+```
+
+没有 Git 时，在仓库页选择 **Code → Download ZIP**，解压后在项目目录打开 PowerShell。然后运行：
 
 ```powershell
 node --version
@@ -12,6 +19,8 @@ npm ci
 npm run doctor
 npm run demo
 ```
+
+若 PowerShell 提示 `npm.ps1` 被执行策略禁止，把以上及后续命令中的 `npm` 换成 `npm.cmd`，例如 `npm.cmd ci`。无需修改全局执行策略。
 
 `npm ci` 按锁文件安装依赖，包括固定版本的 `@playwright/mcp@0.0.83`。`doctor` 检查本机准备情况，`demo` 使用合成材料演练执行和回读，不连接或写入平台。离线检查通过不等于该电脑已通过真实录入验收。
 
@@ -28,17 +37,40 @@ npm run configure -- "--book-id=$bookId"
 
 一书一份独立工作目录，配置、会话、题单、进度和素材一并隔离。换书时保留旧工作目录，从新仓库副本配置另一书；不要修改旧目录的 `bookId`，也不要删除会话文件来绕过书籍检查。仅调整同一书的端口等配置时，先关闭服务并保留原进度。
 
-在 Edge 安装 Playwright 浏览器扩展，登录目标录入页面。首次连接时按扩展页面提示选择正确的录入标签页，并确认浏览器授权。扩展权限可能涉及同一浏览器内其他页面；建议使用专门的工作窗口，关闭无关页面。
+在 Edge 安装 [Playwright 扩展](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm)（[官方安装说明](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md)），登录目标录入页面。扩展权限可能涉及同一浏览器内其他页面；建议使用专门的工作窗口，关闭无关页面。
 
-从 Welcome 页的 `PLAYWRIGHT_MCP_EXTENSION_TOKEN=` 后复制令牌值，运行：
+首次尚未配置令牌时，先在第一个项目终端运行：
+
+```powershell
+npm run recorder:service
+```
+
+服务启动不会自行连接浏览器。保留这个终端，在第二个项目终端运行：
+
+```powershell
+npm run recorder:probe
+```
+
+这次只读连接会弹出扩展 Welcome 页，首次连接允许尚未配置令牌。保持 Welcome 页打开，先复制令牌，暂时不要点 Allow；授权后页面可能关闭或切走。
+
+从 Welcome 页的 `PLAYWRIGHT_MCP_EXTENSION_TOKEN=` 后复制令牌值，在第三个空闲项目终端运行：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/setup-extension-auth.ps1
 ```
 
-按提示粘贴到隐藏输入中。令牌通过 Windows DPAPI 保存，不写入 `config/recorder.json`。不要把令牌粘贴到聊天或命令行参数中，也不要提交加密文件。每位朋友在自己的 Windows 用户下配置一次，不能复制其他人的现有 DPAPI 配置。
+第一个终端正在运行服务，第二个终端可能仍等待 `probe` 连接，两者此时不能用于输入配置命令。按第三个终端的提示粘贴到隐藏输入中。令牌通过 Windows DPAPI 保存，不写入 `config/recorder.json`。不要把令牌粘贴到聊天或命令行参数中，也不要提交加密文件。每位朋友在自己的 Windows 用户下配置一次，不能复制其他人的现有 DPAPI 配置。
 
-已有可用本机令牌时无需重复导入。配置完成后再运行 `npm run doctor`；扩展是否启用、平台登录是否有效由之后的 `probe` 核对。
+导入令牌后，回到 Welcome 页允许本次连接并选择正确的录入标签页。然后在空闲终端查看状态，等待初次连接任务终止，再关闭服务：
+
+```powershell
+npm run recorder:status
+npm run recorder:stop
+```
+
+只有 `status` 确认 `pending` 为空、任务已终止后才运行 `stop`。重新运行 `npm run recorder:service`，让新连接读取令牌；再运行 `npm run doctor` 和 `npm run recorder:probe` 核对扩展及登录状态。后续通常不再需要重复点 Allow。
+
+已有可用本机令牌时无需重复导入，直接按第 4 节启动服务。若上面已经重新启动服务，第 4 节沿用该服务，不要重复启动。
 
 ## 3. 准备与审校题单
 
@@ -67,7 +99,7 @@ npm run review -- --manifest=data/jobs/batch.json
 
 ## 4. 启动与只读核对
 
-在第一个终端运行：
+服务尚未启动时，在第一个终端运行：
 
 ```powershell
 npm run recorder:service

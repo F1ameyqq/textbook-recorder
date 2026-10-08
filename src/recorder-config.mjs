@@ -1,18 +1,56 @@
 import fs from 'node:fs/promises';
+import {realpathSync} from 'node:fs';
 import path from 'node:path';
 
 export const PLATFORM_ORIGIN='https://easylearn.baidu.com';
 export const TASK_ACTIONS=['probe','verify','execute','readback','reconcile'];
 export const CONTROL_ACTIONS=[...TASK_ACTIONS,'pause','close','status'];
-export function workspacePath(root,file){
-  if(typeof file!=='string'||!file||file.includes('\0'))throw new Error('文件路径无效');
-  const full=path.resolve(root,file),relative=path.relative(path.resolve(root),full);
-  if(!relative||relative==='..'||relative.startsWith('..'+path.sep)||path.isAbsolute(relative))throw new Error('文件必须位于执行器项目内');
-  return full;
+function withinWorkspace(root,candidate,allowRoot=false){
+  const relative=path.relative(root,candidate);
+  return (allowRoot||relative!=='')&&relative!=='..'&&!relative.startsWith('..'+path.sep)&&!path.isAbsolute(relative);
 }
-export async function existingWorkspacePath(root,file){const full=await fs.realpath(workspacePath(root,file));workspacePath(root,full);return full;}
-export async function existingWorkspaceDirectory(root,directory){const full=path.resolve(root,directory);if(full!==path.resolve(root))workspacePath(root,full);const resolved=await fs.realpath(full);if(resolved!==await fs.realpath(root))workspacePath(root,resolved);if(!(await fs.stat(resolved)).isDirectory())throw new Error('baseDir 必须是项目内目录');return resolved;}
-export async function writableWorkspacePath(root,file){const full=workspacePath(root,file);let parent=path.dirname(full);while(true){try{const resolved=await fs.realpath(parent);if(resolved!==await fs.realpath(root))workspacePath(root,resolved);break;}catch(error){if(error.code!=='ENOENT')throw error;let exists=false;try{await fs.lstat(parent);exists=true;}catch(statError){if(statError.code!=='ENOENT')throw statError;}if(exists)throw new Error('运行目录链接无法解析，拒绝写入');const next=path.dirname(parent);if(next===parent)throw error;parent=next;}}let exists=false;try{await fs.lstat(full);exists=true;}catch(error){if(error.code!=='ENOENT')throw error;}if(exists){let existing;try{existing=await fs.realpath(full);}catch{throw new Error('运行文件链接无法解析，拒绝写入');}workspacePath(root,existing);}return full;}
+function assertCanonicalPath(root,candidate,allowRoot=false){
+  if(!withinWorkspace(root,candidate,allowRoot))throw new Error('文件必须位于执行器项目内');
+  return candidate;
+}
+function workspaceEntryPath(root,file,allowRoot=false){
+  if(typeof file!=='string'||!file||file.includes('\0'))throw new Error('文件路径无效');
+  const lexicalRoot=path.resolve(root),full=path.resolve(lexicalRoot,file);
+  let canonicalRoot;
+  try{canonicalRoot=realpathSync.native(lexicalRoot);}catch(error){if(error.code!=='ENOENT')throw error;canonicalRoot=lexicalRoot;}
+  if(withinWorkspace(lexicalRoot,full,allowRoot))return path.resolve(canonicalRoot,path.relative(lexicalRoot,full));
+  return assertCanonicalPath(canonicalRoot,full,allowRoot);
+}
+export function workspacePath(root,file){return workspaceEntryPath(root,file);}
+export async function existingWorkspacePath(root,file){
+  const entry=workspacePath(root,file),canonicalRoot=await fs.realpath(root),full=await fs.realpath(entry);
+  return assertCanonicalPath(canonicalRoot,full);
+}
+export async function existingWorkspaceDirectory(root,directory){
+  const entry=workspaceEntryPath(root,directory,true),canonicalRoot=await fs.realpath(root),resolved=await fs.realpath(entry);
+  assertCanonicalPath(canonicalRoot,resolved,true);
+  if(!(await fs.stat(resolved)).isDirectory())throw new Error('baseDir 必须是项目内目录');
+  return resolved;
+}
+export async function writableWorkspacePath(root,file){
+  const full=workspacePath(root,file),canonicalRoot=await fs.realpath(root);
+  let parent=path.dirname(full),canonicalParent;
+  while(true){
+    try{canonicalParent=await fs.realpath(parent);assertCanonicalPath(canonicalRoot,canonicalParent,true);break;}
+    catch(error){
+      if(error.code!=='ENOENT')throw error;
+      let exists=false;try{await fs.lstat(parent);exists=true;}catch(statError){if(statError.code!=='ENOENT')throw statError;}
+      if(exists)throw new Error('运行目录链接无法解析，拒绝写入');
+      const next=path.dirname(parent);if(next===parent)throw error;parent=next;
+    }
+  }
+  let exists=false;try{await fs.lstat(full);exists=true;}catch(error){if(error.code!=='ENOENT')throw error;}
+  if(exists){
+    let existing;try{existing=await fs.realpath(full);}catch{throw new Error('运行文件链接无法解析，拒绝写入');}
+    return assertCanonicalPath(canonicalRoot,existing);
+  }
+  return assertCanonicalPath(canonicalRoot,path.resolve(canonicalParent,path.relative(parent,full)));
+}
 export async function prepareRuntimeDirectory(root,directory){const full=path.resolve(root,directory);await writableWorkspacePath(root,path.join(full,'.recorder-path-check'));await fs.mkdir(full,{recursive:true});return existingWorkspaceDirectory(root,full);}
 export function validateRecorderConfig(value){
   if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!['schemaVersion','bookId','port','origin','inputMode'].includes(key)))throw new Error('录题配置字段无效');

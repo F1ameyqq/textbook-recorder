@@ -20,11 +20,11 @@ export class PersistentRecorderSession{
     this.state={schemaVersion:1,bookId,pending:null,writeBlocked:false,blockedContext:null,last:null,seenIds:[],connectionCount:0};
   }
   async initialize(){
-    await writableWorkspacePath(this.root,this.statePath);
+    this.statePath=await writableWorkspacePath(this.root,this.statePath);
     try{const saved=JSON.parse(await fs.readFile(await existingWorkspacePath(this.root,this.statePath),'utf8')),pending=saved.pending,blocked=saved.blockedContext;
       if(saved.schemaVersion!==1||saved.bookId!==this.bookId||typeof saved.writeBlocked!=='boolean'||!Number.isSafeInteger(saved.connectionCount)||saved.connectionCount<0||!Array.isArray(saved.seenIds)||saved.seenIds.some(id=>!validId(id))||new Set(saved.seenIds).size!==saved.seenIds.length||pending!==null&&(!pending||!saved.seenIds.includes(pending.id)||!TASK_ACTIONS.includes(pending.action)||!Number.isSafeInteger(pending.servicePid)||pending.servicePid<1)||saved.writeBlocked&&(!blocked||typeof blocked.manifest!=='string'||typeof blocked.state!=='string'||!/^[a-f0-9]{64}$/u.test(blocked.manifestSha256??'')))throw new Error('会话进度损坏或缺少原任务恢复绑定');
       if(pending)validateRecorderCommand({id:pending.id,action:pending.action,args:pending.args},this.root);
-      if(blocked){workspacePath(this.root,blocked.manifest);workspacePath(this.root,blocked.state);if(blocked.pendingPath)workspacePath(this.root,blocked.pendingPath);}
+      if(blocked){blocked.manifest=await writableWorkspacePath(this.root,blocked.manifest);blocked.state=await writableWorkspacePath(this.root,blocked.state);if(blocked.pendingPath)blocked.pendingPath=await writableWorkspacePath(this.root,blocked.pendingPath);}
       this.state=saved;
     }catch(error){if(error.code!=='ENOENT')throw error;}
   }
@@ -51,7 +51,7 @@ export class PersistentRecorderSession{
     const baseDir=manifest.baseDir?await existingWorkspaceDirectory(this.root,manifest.baseDir):path.dirname(manifestPath);
     const {inspectReviewedBatch}=await import('./review-preflight.mjs'),report=await inspectReviewedBatch(manifest,baseDir);
     if(manifest.bookId!==this.bookId||manifest.source!=='production'||!report.valid||report.errors?.length||report.readyForExecution===false||manifest.tasks.some(task=>task.review?.status!=='approved'))throw new Error('本地已审题单/覆盖/答案要求校验失败：'+(report.errors??[]).join('; '));
-    await writableWorkspacePath(this.root,context.state);if(context.state===manifestPath)throw new Error('进度不能覆盖题单');
+    context.state=await writableWorkspacePath(this.root,context.state);if(context.state===manifestPath)throw new Error('进度不能覆盖题单');
     return {...context,manifest:manifestPath,manifestSha256:sha(bytes)};
   }
   async bindUnknownRecovery(){
@@ -100,7 +100,7 @@ export class PersistentRecorderSession{
     try{
       const context=action!=='probe'?await this.reviewedContext(args):null;
       if(action==='execute'&&this.state.writeBlocked)throw new Error('保存结果待核对；保留写入锁，禁止再次新增');
-      if(action==='reconcile'&&this.state.writeBlocked){await this.bindUnknownRecovery();const blocked=this.state.blockedContext;if(context.manifest!==blocked.manifest||context.state!==blocked.state||context.manifestSha256!==blocked.manifestSha256||args.taskId!==blocked.taskId||blocked.pendingPath&&path.resolve(this.root,args.pendingPath??blocked.pendingPath)!==blocked.pendingPath)throw new Error('只能核对原失败题单/进度/任务');if(blocked.pendingPath&&args.pendingPath===undefined)args.pendingPath=blocked.pendingPath;}
+      if(action==='reconcile'&&this.state.writeBlocked){await this.bindUnknownRecovery();const blocked=this.state.blockedContext,pendingPath=blocked.pendingPath?await writableWorkspacePath(this.root,args.pendingPath??blocked.pendingPath):null;if(context.manifest!==blocked.manifest||context.state!==blocked.state||context.manifestSha256!==blocked.manifestSha256||args.taskId!==blocked.taskId||blocked.pendingPath&&pendingPath!==blocked.pendingPath)throw new Error('只能核对原失败题单/进度/任务');if(blocked.pendingPath)args.pendingPath=pendingPath;}
       const id=command.id??randomUUID();if(this.state.seenIds.includes(id))throw new Error('命令 ID 已使用，禁止重复派发');
       await this.bind();this.state.pending={id,action,args:structuredClone(args),servicePid:this.connection.servicePid,at:new Date().toISOString()};this.state.seenIds.push(id);
       if(action==='execute'){this.state.writeBlocked=true;this.state.blockedContext={...context,taskId:null,pendingPath:null};}await this.persist();

@@ -25,7 +25,19 @@ if (Test-Path -LiteralPath $taskControl) {
     if ($taskExisting) { Write-Host 'Recorder service is already running. Check status instead of starting another writer.'; exit 0 }
 }
 $taskScript = Join-Path $PSScriptRoot 'run-recorder-service.mjs'
-$taskProcess = Start-Process -FilePath $taskNode -ArgumentList @(('"' + $taskScript + '"'), ('"--config=' + $taskConfig + '"')) -WorkingDirectory $taskRoot -WindowStyle Hidden -RedirectStandardOutput (Join-Path $taskData 'service.stdout.log') -RedirectStandardError (Join-Path $taskData 'service.stderr.log') -PassThru
+function Assert-RecorderLogFile([string]$Path) {
+    try { $taskLogItem = Get-Item -LiteralPath $Path -Force -ErrorAction Stop }
+    catch {
+        if ($_.CategoryInfo.Category -eq [Management.Automation.ErrorCategory]::ObjectNotFound) { return }
+        throw
+    }
+    if ($taskLogItem.PSIsContainer -or $taskLogItem.LinkType -or ($taskLogItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Runtime log files must be regular files, not directories or symbolic links.' }
+}
+$taskStdout = Join-Path $taskData 'service.stdout.log'
+$taskStderr = Join-Path $taskData 'service.stderr.log'
+Assert-RecorderLogFile $taskStdout
+Assert-RecorderLogFile $taskStderr
+$taskProcess = Start-Process -FilePath $taskNode -ArgumentList @(('"' + $taskScript + '"'), ('"--config=' + $taskConfig + '"')) -WorkingDirectory $taskRoot -WindowStyle Hidden -RedirectStandardOutput $taskStdout -RedirectStandardError $taskStderr -PassThru
 Start-Sleep -Milliseconds 700
 $taskProcess.Refresh()
 if ($taskProcess.HasExited) { throw 'Recorder service failed to start. Inspect its local log; no second writer was started.' }
