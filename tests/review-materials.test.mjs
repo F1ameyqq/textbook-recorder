@@ -84,6 +84,30 @@ test('task selection retains complete cross-page content, candidates and exact r
   assert.deepEqual(await fs.readFile(path.join(f.job, 'draft.json')), before);
 });
 
+test('analysis layout markers remain visible offline without external native assets or changing pending content', async t => {
+  const f = await fixture(t);
+  const blocks = [{ type: 'text', text: '第一题完整答案' }, { type: 'analysis-separator' }, { type: 'text', text: '第一题逐题解析' }];
+  f.mappingValue.placements[0].replacementBlocks = { answer: blocks };
+  f.mappingValue.placements[0].agentReview = { checkedAgainstOriginal: true, evidence: '合成原图已核对，答案与解析按明确布局保留' };
+  const mapping = await f.write('mapping.analysis.json', f.mappingValue);
+  const draft = prepareDraftBatch(f.pairedValue, f.mappingValue, f.job, { paired: f.draft.preparation.paired, mapping }).manifest;
+  const manifest = await f.write('draft.analysis.json', draft);
+  const before = await fs.readFile(path.join(f.job, manifest.path));
+  const { packet, html } = createReviewMaterials(draft, manifest.sha256, f.job, { manifestPath: manifest.path, taskIds: ['q1'] });
+  assert.deepEqual(packet.tasks[0].answer.blocks, blocks);
+  const answerStart = html.indexOf('<h3>完整答案');
+  const answerHtml = html.slice(answerStart, html.indexOf('</section>', answerStart));
+  const answerAt = answerHtml.indexOf('第一题完整答案'), separatorAt = answerHtml.indexOf('<hr role="separator"'), analysisAt = answerHtml.indexOf('第一题逐题解析');
+  assert.ok(answerAt >= 0 && separatorAt > answerAt && analysisAt > separatorAt, 'answer and analysis stay on opposite sides of the offline separator');
+  assert.match(answerHtml, /aria-label="答案与解析分隔"/);
+  assert.doesNotMatch(html, /此原生格式仍需人工处理|<script|\b(?:src|href)\s*=\s*["']https?:/iu);
+  assert.equal(packet.readyForExecution, false);
+  assert.equal(packet.automaticApproval, false);
+  assert.equal(draft.tasks[0].review.status, 'pending');
+  assert.ok(Object.values(draft.tasks[0].review.checks).every(value => value === false));
+  assert.deepEqual(await fs.readFile(path.join(f.job, manifest.path)), before);
+});
+
 test('same actual image hash and bbox share one displayed region while every task preserves page/path references', async t => {
   const f = await fixture(t), { value, html } = await f.packet('--tasks=q2,q1');
   assert.deepEqual(value.selectedTaskIds, ['q1', 'q2'], 'preserve manifest order');

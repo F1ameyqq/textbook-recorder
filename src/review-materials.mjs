@@ -218,7 +218,8 @@ export function createReviewMaterials(draft, draftSha256, baseDir, options) {
     limitations: ['定向材料仅定位当前草稿的审校重点，未审校题目不能用缓存替代读图',
       '完整跨页正文、答案和候选来源保留；区域共用不表示答案归属已确认',
       '首次逐页覆盖仍须检查完整题单；本材料不继承旧检查、专项声明或批准',
-      '没有已声明区域的整页仅供查找，不能证明题目边界；原像素 CSS 显示不生成新裁图证据'] };
+      '没有已声明区域的整页仅供查找，不能证明题目边界；原像素 CSS 显示不生成新裁图证据',
+      '解析分隔线以本地横线和文字定位；平台原生图片与实际排版仍须分别验收'] };
   const urls = new Map([...byPath.values()].map(item => [item.raster.id, item.url]));
   return { packet, html: renderReviewMaterials(packet, baseDir, urls), summary: { selectedTasks: tasks.length,
     totalTasks: draft.tasks.length, sourceImages: sourceImages.length, uniqueRegions: regions.length,
@@ -228,6 +229,12 @@ export function createReviewMaterials(draft, draftSha256, baseDir, options) {
 function safeBlocks(editor, baseDir) {
   return (editor?.blocks ?? []).map(block => {
     try {
+      // Display this structural marker without invoking a platform renderer
+      // that may reference an external image. Preserve the block in JSON.
+      if (block?.type === 'analysis-separator') {
+        if (!object(block) || Object.keys(block).some(key => key !== 'type')) throw new Error('解析分隔线仅允许 type 字段');
+        return '<hr role="separator" aria-label="答案与解析分隔"><p class="muted">解析</p>';
+      }
       if (!['text', 'sup', 'sub', 'image'].includes(block?.type)) throw new Error('此原生格式仍需人工处理');
       const html = renderBlockHtml(block, baseDir);
       if (/\b(?:src|href)\s*=\s*["'](?!data:|#)/iu.test(html)) throw new Error('材料不允许联网资源');
