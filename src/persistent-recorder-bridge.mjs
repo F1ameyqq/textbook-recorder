@@ -19,7 +19,8 @@ export async function installPersistentBridge({page,config,adapterFactory=option
   const root=await fs.realpath(config.root),dataDir=path.join(root,'data/persistent-executor');
   await prepareRuntimeDirectory(root,dataDir);await prepareRuntimeDirectory(root,path.join(dataDir,'jobs'));
   const guard=()=>assertRecorderPage(page.url(),validated.bookId);
-  let adapter,job=null,stopping=false;
+  let adapter,job=null,stopping=false,pauseGeneration=0,pauseLatched=false;
+  const continuationFence=()=>({schemaVersion:1,previousTerminalId:job?.terminal===true?job.id:null,pauseGeneration,paused:pauseLatched});
   const getAdapter=async()=>{guard();await prepareRuntimeDirectory(root,dataDir);for(const folder of ['new-system-recovery','directory-visibility-diagnostics'])await prepareRuntimeDirectory(root,path.join(dataDir,folder));await page.bringToFront();if(!adapter){adapter=adapterFactory({page,baseDir:root,dataDir,source:'production',origin:validated.origin,inputMode:'browser-command',waitForEditors:false});await adapter.connect(validated.bookId);}return adapter;};
   const stage=(phase,taskId=null)=>{const at=new Date().toISOString();if(job.phaseStartedAt)job.timings.push({phase:job.phase,taskId:job.phaseTaskId,startedAt:job.phaseStartedAt,finishedAt:at,elapsedMs:Date.parse(at)-Date.parse(job.phaseStartedAt)});job.phase=phase;job.phaseTaskId=taskId;job.phaseStartedAt=at;};
   const load=async(args,action)=>{
@@ -77,13 +78,24 @@ export async function installPersistentBridge({page,config,adapterFactory=option
     return {bookId:validated.bookId,statePath:context.statePath,manifestPath:context.manifestPath,stateStatus:result.status,stopReason:result.status==='stopped'?(stopping?'pause':'limit'):null,counts:result.tasks.reduce((all,row)=>({...all,[row.status]:(all[row.status]??0)+1}),{}),uncertain:unresolved.length>0||action==='execute'&&active._uncertain===true,pendingWrite:unresolved.length?pendingSummary(active):null,writePerformed:action==='execute',...(action==='verify'?{readbackEvidence,sectionEvidence}:{})};
   };
   const bridge={
-    status:()=>{guard();return {bookId:validated.bookId,job:job?{...copy(job),adapterPhase:adapter?.pendingWrite?.phase??null}:null};},
-    pause:()=>{guard();stopping=true;if(job?.running)job.stopRequested=true;return {bookId:validated.bookId,stopRequested:true};},
-    start:({id,action,args={}})=>{
-      guard();if(typeof id!=='string'||!/^[A-Za-z0-9_-]{1,80}$/u.test(id))throw new Error('命令 ID 无效');validateRecorderCommand({id,action,args},root);if(!['probe','collect','verify','execute','readback','reconcile'].includes(action))throw new Error('该动作不可作为浏览器任务');if(job?.running)throw new Error('已有任务运行');if(job?.id===id)throw new Error('命令 ID 已使用');
-      stopping=false;job={id,action,running:true,terminal:false,startedAt:new Date().toISOString(),phase:null,phaseTaskId:null,phaseStartedAt:null,timings:[],progress:null};
+    status:()=>{guard();return {bookId:validated.bookId,pausePersistenceSupported:true,continuationFence:continuationFence(),job:job?{...copy(job),adapterPhase:adapter?.pendingWrite?.phase??null}:null};},
+    syncPause:control=>{guard();if(!control||control.schemaVersion!==1||Object.keys(control).some(key=>!['schemaVersion','generation','paused'].includes(key))||!Number.isSafeInteger(control.generation)||control.generation<0||typeof control.paused!=='boolean')throw new Error('持久暂停同步参数无效');pauseGeneration=Math.max(pauseGeneration,control.generation);pauseLatched ||= control.paused;if(pauseLatched)stopping=true;return {bookId:validated.bookId,continuationFence:continuationFence()};},
+    pause:(options={})=>{guard();if(Object.keys(options).some(key=>key!=='pauseGeneration')||options.pauseGeneration!==undefined&&(!Number.isSafeInteger(options.pauseGeneration)||options.pauseGeneration<1))throw new Error('暂停版本无效');stopping=true;pauseLatched=true;pauseGeneration=options.pauseGeneration===undefined?pauseGeneration+1:Math.max(pauseGeneration,options.pauseGeneration);if(job)job.stopRequested=true;return {bookId:validated.bookId,stopRequested:true,continuationFence:continuationFence()};},
+    start:({id,action,args={},continuationGuard,resumePauseGeneration})=>{
+      guard();if(typeof id!=='string'||!/^[A-Za-z0-9_-]{1,80}$/u.test(id))throw new Error('命令 ID 无效');const command=validateRecorderCommand({id,action,args,...(continuationGuard===undefined?{}:{continuationGuard})},root);if(!['probe','collect','verify','execute','readback','reconcile'].includes(action))throw new Error('该动作不可作为浏览器任务');
+      if(resumePauseGeneration!==undefined&&(action!=='execute'||continuationGuard||!Number.isSafeInteger(resumePauseGeneration)||resumePauseGeneration<0))throw new Error('普通执行的暂停恢复版本无效');
+      let acceptedGuard;
+      if(command.continuationGuard){
+        const fence=continuationFence(),expected=command.continuationGuard,priorSafe=expected.phase==='initial'?(!job||job.terminal===true&&!job.running):job?.terminal===true&&!job.running&&job.action==='execute'&&!job.error&&!job.evidenceError&&job.result?.stateStatus==='stopped'&&job.result?.stopReason==='limit'&&job.result?.uncertain===false&&!job.result?.pendingWrite;
+        if(!priorSafe||fence.paused||fence.previousTerminalId!==expected.previousTerminalId||fence.pauseGeneration!==expected.pauseGeneration)return {bookId:validated.bookId,id,started:false,rejected:'continuation-fence',writePerformed:false,uncertain:false,continuationFence:fence};
+        acceptedGuard={...copy(expected),bookId:validated.bookId,commandId:id};
+      }
+      if(resumePauseGeneration!==undefined&&resumePauseGeneration!==pauseGeneration)return {bookId:validated.bookId,id,started:false,rejected:'pause-fence',writePerformed:false,uncertain:false,continuationFence:continuationFence()};
+      if(job?.running)throw new Error('已有任务运行');if(job?.id===id)throw new Error('命令 ID 已使用');
+      const pauseResumeAccepted=resumePauseGeneration===undefined?null:{schemaVersion:1,pauseGeneration:resumePauseGeneration,bookId:validated.bookId,commandId:id};
+      stopping=false;if(action==='execute'&&!acceptedGuard)pauseLatched=false;job={id,action,running:true,terminal:false,startedAt:new Date().toISOString(),phase:null,phaseTaskId:null,phaseStartedAt:null,timings:[],progress:null,...(acceptedGuard?{continuationGuardAccepted:acceptedGuard}:{}),...(pauseResumeAccepted?{pauseResumeAccepted}:{})};
       execute(action,args).then(result=>{job.result=result;}).catch(error=>{job.error=clean(error);job.result={...(action==='collect'?{...error.collection,writePerformed:false}:{}),uncertain:action==='execute'&&(adapter?.pendingWrite?.status==='pending'||adapter?._uncertain===true),pendingWrite:pendingSummary(adapter)};}).finally(async()=>{stage('terminal');job.finishedAt=new Date().toISOString();try{await atomic(root,path.join(dataDir,'jobs',id,'job-result.json'),{...job,running:false,terminal:true});}catch(error){job.evidenceError=clean(error);job.error??=job.evidenceError;if(action==='execute')job.result={...job.result,uncertain:true,pendingWrite:pendingSummary(adapter)};}job.running=false;job.terminal=true;});
-      return {bookId:validated.bookId,id,started:true};
+      return {bookId:validated.bookId,id,started:true,continuationFence:continuationFence(),...(acceptedGuard?{continuationGuardAccepted:acceptedGuard}:{}),...(pauseResumeAccepted?{pauseResumeAccepted}:{})};
     },
   };
   Object.defineProperty(page,'__persistentRecorder',{value:bridge});return bridge;

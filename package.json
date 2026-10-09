@@ -15,6 +15,7 @@
     "review": "node scripts/review-batch.mjs",
     "check:share": "node scripts/check-share.mjs",
     "recorder:service": "node scripts/run-recorder-service.mjs",
+    "recorder:start": "node scripts/ensure-recorder-service.mjs",
     "recorder:status": "node scripts/recorder-control.mjs status",
     "recorder:probe": "node scripts/recorder-control.mjs probe",
     "recorder:verify": "node scripts/run-reviewed-batch-service.mjs --action=verify",

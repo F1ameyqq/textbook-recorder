@@ -71,10 +71,16 @@ export function assertRecorderPage(urlText,bookId){
   const url=new URL(urlText),parts=url.hash.split('?'),query=new URLSearchParams(parts[1]);
   if(url.origin!==PLATFORM_ORIGIN||url.username||url.password||url.pathname!=='/edu-shop-web/'||parts.length!==2||parts[0]!=='#/content-manager/teaching-content'||query.getAll('textbookID').length!==1||query.get('textbookID')!==String(bookId)||query.getAll('textbookType').length!==1||query.get('textbookType')!=='main')throw new Error('当前页不是本地配置指定的书籍录入页');
 }
+export function validateContinuationGuard(value){
+  const keys=['schemaVersion','previousTerminalId','pauseGeneration','phase','connectionCount'];
+  if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!keys.includes(key))||value.schemaVersion!==1||!(value.previousTerminalId===null||typeof value.previousTerminalId==='string'&&/^[A-Za-z0-9_-]{1,80}$/u.test(value.previousTerminalId))||!Number.isSafeInteger(value.pauseGeneration)||value.pauseGeneration<0||!Number.isSafeInteger(value.connectionCount)||value.connectionCount<1||!['initial','limit'].includes(value.phase))throw new Error('自动接续须提供严格绑定终止命令、连接和暂停版本的 continuationGuard');
+  return structuredClone(value);
+}
 export function validateRecorderCommand(command,root){
-  if(!command||typeof command!=='object'||Array.isArray(command)||Object.keys(command).some(key=>!['id','action','args'].includes(key)))throw new Error('只接受固定命令，不允许任意脚本');
+  if(!command||typeof command!=='object'||Array.isArray(command)||Object.keys(command).some(key=>!['id','action','args','continuationGuard'].includes(key)))throw new Error('只接受固定命令，不允许任意脚本');
   const {action,args={}}=command;
   if(!CONTROL_ACTIONS.includes(action)||!args||typeof args!=='object'||Array.isArray(args))throw new Error('命令或参数无效');
+  let continuationGuard;if(command.continuationGuard!==undefined){if(action!=='execute')throw new Error('continuationGuard 仅允许用于 execute');continuationGuard=validateContinuationGuard(command.continuationGuard);}
   const allowed=action==='collect'?['from','to','output']:action==='probe'?['chapterLabel','sectionLabel','inventory','exportRecords']:['status','pause','close'].includes(action)?[]:['manifest','state',...(['execute','verify'].includes(action)?['limit']:['taskId']),...(action==='readback'?['capture']:[]),...(action==='reconcile'?['pendingPath']:[])];
   if(Object.keys(args).some(key=>!allowed.includes(key)))throw new Error('命令参数无效，不接受专项修复或代码参数');
   if(action==='collect'){
@@ -92,5 +98,5 @@ export function validateRecorderCommand(command,root){
   }
   for(const field of ['manifest','state','pendingPath'])if(args[field]!==undefined)workspacePath(root,args[field]);
   if(command.id!==undefined&&!/^[A-Za-z0-9_-]{1,80}$/u.test(command.id))throw new Error('命令 ID 无效');
-  return {action,args};
+  return {action,args,...(continuationGuard?{continuationGuard}:{})};
 }

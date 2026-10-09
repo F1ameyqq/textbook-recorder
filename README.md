@@ -19,6 +19,8 @@
 
 用户可一次授权明确范围内的追加，agent 在范围内接续完成，不逐题重复确认。未知保存、删除或重建不自动扩入范围。缺参考答案如何处理也要沿用本次明确规则，不能套用别人的历史授权。
 
+先用 `recorder:start` 启动或复用一个后台服务，本身不连接浏览器；`recorder:service` 保留为前台诊断入口。整个任务使用同一个服务，probe、collect、execute、verify、readback、reconcile 都经仓库 controller 沿用服务连接。不要让 agent 为每条命令生成重新 `connectMcp` 的 runner。controller 的 `--wait --summary` 和批处理 CLI 内部等待负责监督，状态默认给摘要，异常诊断才展开 `--details`，减少反复轮询和无关输出。原图判断仍由 agent 实际完成。
+
 skill 依赖本仓库程序和参考文件；单独复制 `SKILL.md` 不构成安装。详细机械接口见[工作流](.agents/skills/textbook-recorder/references/workflow.md)和[数据接口](.agents/skills/textbook-recorder/references/schema.md)。
 
 仓库 skill 目录采用 Codex 的 `.agents/skills` 约定；发现和调用方式见 [OpenAI 官方说明](https://learn.chatgpt.com/docs/build-skills#where-codex-loads-local-skills)。
@@ -64,7 +66,7 @@ $bookId = Read-Host '输入本次负责的书号'
 npm run configure -- "--book-id=$bookId"
 ```
 
-配置命令不会覆盖已有文件。首次令牌尚未配置时，在一个终端运行 `npm run recorder:service`，第二个项目终端运行 `npm run recorder:probe`。保持弹出的扩展 Welcome 页打开，先复制 `PLAYWRIGHT_MCP_EXTENSION_TOKEN=` 后的令牌值，在第三个空闲项目终端配置自己的令牌；前两个终端正在运行或等待，不能用于输入配置命令：
+配置命令不会覆盖已有文件。首次令牌尚未配置时，运行 `npm run recorder:start`，返回后在同一项目终端运行 `npm run recorder:probe -- --wait --summary`。保持弹出的扩展 Welcome 页打开，先复制 `PLAYWRIGHT_MCP_EXTENSION_TOKEN=` 后的令牌值，在另一个空闲项目终端配置自己的令牌；原终端正在等待连接，不能用于输入配置命令：
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/setup-extension-auth.ps1
@@ -72,7 +74,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/setup-extension-
 
 令牌通过本地隐藏输入保存，使用 Windows DPAPI 加密；不要发到聊天、提交 Git 或复制给朋友。每台电脑、每个 Windows 用户各自配置。`doctor` 和 `demo` 不写入平台。
 
-令牌导入后，回到 Welcome 页允许本次连接并选择正确的录入标签页。用 `npm run recorder:status` 等待初次连接任务终止，再运行 `npm run recorder:stop`，重新启动 `npm run recorder:service` 使令牌生效。再运行 `npm run doctor` 和 `npm run recorder:probe` 检查准备情况。已有可用本机令牌时可直接启动服务。
+令牌导入后，回到 Welcome 页允许本次连接并选择正确的录入标签页。等初次 probe CLI 返回终止摘要后，再运行 `npm run recorder:stop`，重新运行 `npm run recorder:start` 使令牌生效。再运行 `npm run doctor` 和 `npm run recorder:probe -- --wait --summary` 检查准备情况。已有可用本机令牌时可直接启动服务；之后全任务沿用该服务。
 
 [快速开始](docs/quickstart.md)说明连接、审校、执行及关闭步骤。先完成离线演练和只读核对，再录入自己的小批题单。
 
@@ -80,23 +82,34 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/setup-extension-
 
 ```powershell
 npm run review -- --manifest=data/jobs/job-01/batch.approved.json
-npm run recorder:service
+npm run recorder:start
 ```
 
-服务启动后尚未连接浏览器。在另一个项目终端运行：
+服务启动后尚未连接浏览器。启动命令返回后，在同一项目终端运行：
 
 ```powershell
 npm run recorder:status
-npm run recorder:probe
-npm run recorder:verify -- --manifest=data/jobs/job-01/batch.approved.json --state=data/jobs/job-01/progress.json --limit=20
-npm run recorder:execute -- --manifest=data/jobs/job-01/batch.approved.json --state=data/jobs/job-01/progress.json --limit=20
+npm run recorder:probe -- --wait --summary
+npm run recorder:verify -- --manifest=data/jobs/job-01/batch.approved.json --state=data/jobs/job-01/progress.json
+npm run recorder:execute -- --manifest=data/jobs/job-01/batch.approved.json --state=data/jobs/job-01/progress.json --limit=1
 npm run recorder:pause
+npm run recorder:status
 npm run recorder:stop
 ```
 
-普通 `probe` 只核对书号与连接，`recordCount: null` 不是目录基线。需采集原图时，先在两编辑器原本为空时 `collect`，再运行带 `chapterLabel`、`sectionLabel`、`exportRecords: true` 参数文件的单节 `probe`；后者会选择已有题目并使编辑器非空。基线导出后按 `recordCount + 1` 准备 mapping。以上 verify/execute 用于材料和基线已准备好的题单；完整顺序见[工作流](.agents/skills/textbook-recorder/references/workflow.md)。
+普通 `probe` 只核对书号与连接，`recordCount: null` 不是目录基线。需采集原图时，先在两编辑器原本为空时经 `node scripts/recorder-control.mjs collect <参数.json> --wait --summary` 采集，再运行带 `chapterLabel`、`sectionLabel`、`exportRecords: true` 参数文件的单节 `probe`；后者会选择已有题目并使编辑器非空。基线导出后按 `recordCount + 1` 准备 mapping。以上 verify/execute 用于材料和基线已准备好的题单；完整顺序见[工作流](.agents/skills/textbook-recorder/references/workflow.md)。
 
-`execute` 默认最多处理 20 条。达到上限后的正常 `stopped` 不等于失败；确认 `pending` 为空、`writeBlocked` 为 `false`、无错误且已处理题目回读通过后，可用同一题单和进度路径再次执行接续。整批只读核对应显式设置足够的 `--limit`，详见快速开始。命令返回任务标识不等于录入完成；以状态中的终止结果、逐题保存证据和刷新回读为准。执行时保持目标页面可用，不在同一页面手动编辑。
+首本书、首台电脑先用 `--limit=1` 试录，不加 `--continue`。确认真实保存与刷新回读通过，整份题单已批准且处于既有授权范围内时，再运行：
+
+```powershell
+npm run recorder:execute -- --manifest=data/jobs/job-01/batch.approved.json --state=data/jobs/job-01/progress.json --limit=20 --continue
+```
+
+`execute` 默认每轮最多处理 20 条；`--continue` 只在正常 limit 终止、pending 为空、无错误或写入锁且已处理题目保存与回读通过时自动接续。服务端同时检查暂停版本及原终止命令，轮次间 pause 也停止接续。pause、error 和未知保存都会停止。沿用同一 manifest/state，不连续提高限制绕过试录或授权，不删除进度重跑。`verify` 不给 `--limit` 时默认核对整份题单（最多 1000 条）；显式较小上限只证明部分通过。命令返回任务标识不等于录入完成；以终止摘要、逐题保存证据和刷新回读为准。执行时保持目标页面可用，不在同一页面手动编辑。
+
+暂停状态跨断线和服务重启保留，status、probe 等只读操作不解除暂停。用户已有明确恢复授权时，先用原 manifest/state 执行不带 `--continue` 的 execute，通常沿用原 limit；确认该轮终止安全后才再次 `--continue`。已有明确恢复授权即可操作，不增加重复确认流程；未知保存或写入锁仍按原任务恢复说明处理。
+
+`recorder:status` 给只读摘要：未连接时 GET/status 不主动建立初次浏览器连接；已有连接意外断线时，status/heartbeat 可按上限自动恢复一次，只有显式连接才重置该上限。确需诊断时使用 `npm run recorder:status -- --details`。controller 默认等待上限为 30 分钟，可用 `--timeout-ms=毫秒数`（1 到 3600000）调整；超时保留任务和进度，先只读核对，不重发。pause 后须确认原任务已终止且 pending 为空，再运行 stop。服务仅可清理自己创建、身份可确认、无未知保存且两编辑器确认空白的临时页；用户已有页和历史未登记标签页保留，不能批量关闭或删除。
 
 ## 审校与协作
 
@@ -106,6 +119,8 @@ npm run recorder:stop
 - [本地工作流工具](docs/workflow-tools.md)：逐题原图对照、问题定位、待填写审校模板、修订差异和任务版本登记。
 
 朋友之间分配不同书籍或明确不重叠的目录。不能共同写同一节；本机运行锁不能阻止另一台电脑写入相同目录。
+
+读图、转录、配对和审校阶段可复用同一 job 已实际看过且 hash、bbox 相同的原图；修订按 `workflow:diff` 定向定位受影响的完整题和来源区域。来源或范围变化仍需重新看图。当前内容与覆盖要实际核对，并为新草稿形成 hash-bound 批准；缓存和旧批准不能替代未完成的审校。
 
 ## 开发验证与仓库内容
 
