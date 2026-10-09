@@ -52,7 +52,7 @@ export async function reviewOutputDirectory(root, cwd, requested) {
 }
 
 export async function writeReviewFiles(root, directory, entries) {
-  const allowed = new Set(['preflight.json', 'preview.html', 'diff.json', 'diff.html']);
+  const allowed = new Set(['preflight.json', 'preview.html', 'diff.json', 'diff.html', 'materials.json', 'materials.html']);
   const project = await fs.realpath(root);
   const output = await reviewOutputDirectory(project, project, directory);
   const pending = [];

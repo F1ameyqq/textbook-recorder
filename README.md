@@ -4,6 +4,8 @@
 
 题目拆分、答案对应和原书覆盖由 agent 对照原图判断，也可以人工复核。本地脚本不调用云端大模型 API；CPU OCR 在本机运行识别模型，agent 读图和判断仍消耗其额度。本项目提供 agent 辅助的完整操作流程；采集及新书、新电脑的安装到录入流程仍需实际验收，不能据此承诺零额度、全自动或无人值守完成整本书。
 
+本地准备可用 `workflow:mapping` 从已确认题序和目录基线生成待填写骨架，`workflow:conflicts` 集中显示配答问题与候选，`workflow:materials` 为指定完整题或修订差异生成定向原图材料包。三项都只处理明确提供的本地材料，保留待审状态；接口见[本地工作流工具](docs/workflow-tools.md)。
+
 ## 让 agent 使用 skill
 
 先取得完整仓库，再以仓库根作为 agent 工作目录。支持仓库 skill 发现的 agent 可调用 `$textbook-recorder`；未出现在列表时，可明确要求读取 [.agents/skills/textbook-recorder/SKILL.md](.agents/skills/textbook-recorder/SKILL.md)。其他 agent 也可显式读取该文件，使用自己的 shell 和本地读图工具按工作流操作，不需要相同的 CUA 插件。

@@ -2,6 +2,46 @@
 
 这些工具帮助定位原图、修订题单和管理文件版本，不连接录入平台。原图判断、覆盖核对、哈希绑定批准及未知保存恢复仍按原工作流执行。所有命令从仓库根目录运行。
 
+## 集中定位配答冲突
+
+在配对后、生成草稿前，可以将有问题的完整题目与候选答案集中导出：
+
+```powershell
+npm run workflow:conflicts -- --input=data/jobs/job-01/paired.json --records=data/jobs/job-01/records.json --index=data/jobs/job-01/index.json --output=data/jobs/job-01/pairing-conflicts.json
+```
+
+三个输入必须属于同一 job，paired 中的来源路径与原始字节哈希必须绑定这份 records。报告保留原配对、issues 和 review 状态，提供问题题目全文、候选答案全文、完整章/单元/栏目/题号身份、原图路径、区域与实际哈希。缺少候选或缺答时明确列出诊断，不猜答案或删除问题。
+
+输出为只读定位 JSON，带 `referenceOnly: true` 和 `readyForExecution: false`；它不会改动输入、选择候选或生成批准。对照原图修订 records 后，以新文件名重新配对并生成报告。输出拒绝覆盖已有文件，不扫描与冲突题及候选无关的原图像素。
+
+## 从已确认题序生成 mapping 骨架
+
+使用后文任务登记的 `local-workflow-plan` 格式明确书号、source、正文及答案页、目标章/节、起点和本轮上限，再准备已经按原图确认的题序文件 `order.json`。例如：
+
+```json
+{
+  "schemaVersion": 1,
+  "kind": "confirmed-question-order",
+  "bookId": 900001,
+  "confirmed": true,
+  "sections": [{"chapterLabel": "合成章", "sectionLabel": "合成节", "questionIds": ["question-01", "activity-01"]}]
+}
+```
+
+`confirmed: true` 由实际核对题序者声明，仅确认排列，不表示完成审校或获得平台执行许可。列出的完整题必须与 paired 的任务集合及次序一致；不按题号、OCR 或文件名猜顺序。需要重排时，先修订 records 并重新生成 paired。
+
+```powershell
+npm run workflow:mapping -- --input=data/jobs/job-01/paired.json --plan=data/jobs/job-01/plan.json --order=data/jobs/job-01/order.json --index=data/jobs/job-01/index.json --output=data/jobs/job-01/mapping.template.json
+```
+
+生产材料另给 `--baseline=data/jobs/job-01/baseline.json`，只接受包含完整顺序记录的同书、同章/节基线；每节起点必须等于该基线记录数加一，冲突就拒绝生成。基线原始字节复制及多节格式见后文任务登记。fixture 使用明确给定的起点，不要求平台基线。已有裁图证据时可另给 `--crops=data/jobs/job-01/source.json`，由工具填写其实际哈希。
+
+骨架采用现有 `new-system-draft-mapping` 接口，机械填写章/节、连续序号、输入及来源哈希，提供 `requiredFields` 提示。具体作答要求、缺答规则、逐页候选及排除理由、实际审校说明仍须补全；来源引用只供定位。检查默认为 false，evidence 为空，不复制旧检查或批准。未填写具体作答要求的骨架不能直接生成草稿；补全后另存 `mapping.json`，再走原 `workflow:draft` 与审校流程。执行前仍需核对实时平台基线，工具不会因基线变化静默平移已有序号。
+
+`answerStatus: "provided"` 表示原书提供参考答案，不代表配对已确定；有候选但未配定时保留配对问题。`not-provided` 也不会授予缺答备注规则，缺答范围与本次用户授权仍按原接口处理。
+
+`requiredFields` 是生成骨架时的待填写清单，手工补全后不会自动更新；实际完整性以新草稿的预检及原图审校为准。
+
 ## 原图对照与问题定位
 
 ```powershell
@@ -13,6 +53,24 @@ npm run review -- --manifest=data/jobs/job-01/batch.draft.json
 `preflight.json` 的 `diagnostics` 提供级别、代码、字段或块位置、页/题锚点、建议修改的输入和处理说明。预览中的问题可以点击跳到对应题干、答案或覆盖候选。`review.issues` 和专项阻断保持可见；建议只是定位，不能删 issue 或直接填 true 来消除问题。
 
 预览为无脚本的本地 HTML，只嵌入经过检查的 PNG/JPEG，不连接网络，不提供批准或平台写入按钮。
+
+## 生成定向审校材料包
+
+入口只接受能从冻结来源重新生成的完整 pending 草稿，为指定任务、当前预检问题或修订差异选择完整题目。每次恰选一种方式：
+
+```powershell
+npm run workflow:materials -- --manifest=data/jobs/job-01/batch.draft.json --tasks=question-01,activity-01
+npm run workflow:materials -- --manifest=data/jobs/job-01/batch.draft.json --diagnostics=all
+npm run workflow:materials -- --manifest=data/jobs/job-01/batch.draft.v2.json --diff=data/review/job-01-diff/diff.json
+```
+
+`--diagnostics` 支持 `error`、`warning`、`review`、`all`；问题由当前完整题单的预检产生。diff 须绑定当前原始字节哈希与路径，工具重新读取同 job 的前后版本计算差异，不能只相信外部填入的 affectedTaskIds。可用 `--outputdir=data/review/job-01-materials-v2` 指定新的输出目录，已有结果不会覆盖。
+
+材料包提供 `materials.json` 和无脚本、无网络请求的 `materials.html`，包含所选完整题干、答案、配对记录与候选、相关逐页覆盖上下文、原图区域及实际哈希。跨页题保留全部已声明来源区域；相同原图字节和 bbox 的重复区域共用一个区域引用，各题的引用次序仍保留。JSON 的原图路径便于直接读图，HTML 嵌入原图字节供离线对照。
+
+这些引用仅供定位，不是读图证据。定向包不修改完整题单、不复制已批准 checks，也不生成子集批准。首次逐页覆盖仍查看全部正文页；来源或配对变化时重新检查受影响的完整题，新草稿仍要形成绑定完整字节哈希的审校决定。空选择或仅少量材料不能报告为整批通过。
+
+`workflow:draft` 返回 `valid: false`、退出码 1 时，若摘要给出 `outputPath`，可能已经保留了可供审校的 pending 阻断草稿，仍可用 materials 定位问题。结构或来源错误导致生成前抛错时则没有草稿；先读错误和实际输出，不为取得成功退出码删除 issue 或补虚构授权。
 
 ## 准备待填写的审校决定
 

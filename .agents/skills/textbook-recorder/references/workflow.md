@@ -80,6 +80,8 @@ npm run review -- --manifest=data/jobs/job-01/batch.draft.json
 
 配对 CLI 只构造保守候选，draft 始终 `pending`。查看输出 issues 和离线题答/原图预览，对照原图修正 `records.json` 或 mapping，再生成新文件；不要删除 issue 后直接批准。准备材料，包括原图/OCR、索引、records、paired、裁图证据、mapping、decisions 及草稿/批准题单，放在同一个 `data/jobs/<job>` 下，使用相对资产路径。`npm run review` 的报告和预览默认输出到独立的忽略目录 `data/review`，无需放回 job；指定输出也须在允许的 `data/review` 内。
 
+配对后可用 `workflow:conflicts` 将问题题目和完整候选答案集中导出。已有明确 plan 与确认题序时，用 `workflow:mapping` 填写目录、起点和实际哈希，再实际补全作答要求及覆盖清单。草稿生成后，`workflow:materials` 按任务、当前预检问题或版本 diff 输出完整题及去重原图区域，减少反复读取整批材料。命令参数及待填写边界见[本地工具](../../../../docs/workflow-tools.md)；这些辅助不判断题序、解决配答或授予批准。
+
 生成文件不会覆盖已有输出。修正后使用新的 paired/draft/decisions/approved 文件名，并将后续命令及哈希引用指向这一版；保留旧草稿和审校证据。
 
 预览按题并排显示真实原图区域和录入内容，并提供逐题 issues、专项问题及覆盖候选的定位链接。修改草稿后可用 `npm run workflow:diff -- --before=<同 job 旧草稿> --after=<同 job 新草稿>` 查看差异与受影响的完整题；不会迁移旧批准。可选的 `workflow:job` 登记实际范围、文件哈希和版本，推导本地阶段，不连接平台或替代上面的基线顺序。具体接口按[本地工具](../../../../docs/workflow-tools.md)。
