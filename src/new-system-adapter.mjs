@@ -6,9 +6,15 @@ import { chromium } from 'playwright';
 import { renderEditorHtml, compareNewSystemReadback, verifyNewSystemSave } from './new-system-core.mjs';
 import { writeWindowsClipboardHtml } from './windows-html-clipboard.mjs';
 import { insertReviewedEditorHtml } from './browser-editor-command.mjs';
+import { readEditorNativeEmphasis, assertEditorNativeEmphasis } from './native-emphasis.mjs';
 import { checkedPointerClick } from './checked-pointer-click.mjs';
+import { waitForAppendAutosaveReady, readAppendAutosaveSnapshot } from './append-autosave-readiness.mjs';
 import { waitVisibleByTimer } from './timer-visible-wait.mjs';
 import { captureResponseBeforeWait } from './deferred-response-wait.mjs';
+import { activateRecorderPage, validateBrowserFocusMode, validateBrowserWindowMode } from './browser-focus.mjs';
+import { requireRecorderDocumentReady } from './browser-document-state.mjs';
+import { existingWorkspacePath, writableWorkspacePath } from './recorder-config.mjs';
+import { validateHistoricalNetworkRecovery, validHistoricalNetworkRecoveryProof } from './historical-network-recovery.mjs';
 
 const SITE = 'https://easylearn.baidu.com';
 const LIST_PATH = '/edushop/textbook/detail/shitilist';
@@ -44,6 +50,50 @@ function requestMatches(request, origin, pathname) {
   catch { return false; }
 }
 
+function appendIntentIdentity(pending) {
+  return { schemaVersion:pending.schemaVersion, kind:pending.kind, bookId:pending.bookId,
+    nodeID:pending.nodeID, task:pending.task, priorRecords:pending.priorRecords,
+    startedAt:pending.startedAt, evidencePath:pending.evidencePath };
+}
+
+/** Read frozen raw inputs; a caller-supplied proof object is never accepted. */
+export async function readHistoricalNetworkEvidence(root, evidencePath, {context, pendingPath}) {
+  const file = await existingWorkspacePath(root,evidencePath), bytes = await fs.readFile(file), bundle = JSON.parse(bytes);
+  const hash = value => createHash('sha256').update(value).digest('hex');
+  const assert = (condition,message) => {if(!condition)throw new Error(message);};
+  const keys = ['history','lifetime','priorBatch','failedBatch','pending','anchorPending','freshScope','freshScopeJob','freshReadback','freshReadbackJob'];
+  assert(bundle.schemaVersion===1&&bundle.kind==='historical-network-recovery-evidence'&&bundle.files
+    &&Object.keys(bundle).sort().join(',')==='files,kind,schemaVersion'
+    &&Object.keys(bundle.files).sort().join(',')===keys.sort().join(','),'历史网络证据束结构不完整');
+  const read = async ref => {
+    assert(ref&&Object.keys(ref).sort().join(',')==='path,sha256'&&typeof ref.path==='string'&&/^[a-f0-9]{64}$/u.test(ref.sha256),'历史网络证据引用须有固定路径和SHA256');
+    const pathname=await existingWorkspacePath(root,ref.path), raw=await fs.readFile(pathname);
+    assert(hash(raw)===ref.sha256,'历史网络证据文件SHA256已改变');
+    return raw;
+  };
+  const batch = async refs => {
+    assert(refs&&Object.keys(refs).sort().join(',')==='job,manifest,preflight,state','历史网络原批次引用不完整');
+    const entries=await Promise.all(Object.entries(refs).map(async([name,ref])=>[name+'Bytes',await read(ref)]));
+    return Object.fromEntries(entries);
+  };
+  assert(Array.isArray(bundle.files.anchorPending)&&bundle.files.anchorPending.length===14,'历史网络证明必须冻结14个原保存意图');
+  const input={historyBytes:await read(bundle.files.history),lifetimeBytes:await read(bundle.files.lifetime),priorBatch:await batch(bundle.files.priorBatch),failedBatch:await batch(bundle.files.failedBatch),
+    pendingBytes:await read(bundle.files.pending),anchorPendingBytes:await Promise.all(bundle.files.anchorPending.map(read)),
+    freshScopeBytes:await read(bundle.files.freshScope),freshScopeJobBytes:await read(bundle.files.freshScopeJob),
+    freshReadbackBytes:await read(bundle.files.freshReadback),freshReadbackJobBytes:await read(bundle.files.freshReadbackJob)};
+  const history=JSON.parse(input.historyBytes),corePath=await existingWorkspacePath(root,'node_modules/playwright-core/lib/coreBundle.js'),sdkPath=await existingWorkspacePath(root,'node_modules/playwright-core/package.json');
+  const coreBytes=await fs.readFile(corePath),sdkBytes=await fs.readFile(sdkPath);
+  assert(hash(coreBytes)===history.coreSha256&&JSON.parse(sdkBytes).version===history.sdkVersion,'当前实际SDK字节或版本与原网络观察源码不符');
+  const currentManifest=await existingWorkspacePath(root,context.manifestPath),currentState=await existingWorkspacePath(root,context.statePath),originalPendingPath=await existingWorkspacePath(root,pendingPath);
+  const bound=await Promise.all([currentManifest,currentState,originalPendingPath,corePath,sdkPath].map(async pathname=>({pathname,sha256:hash(await fs.readFile(pathname))})));
+  assert(bound[0].sha256===hash(input.failedBatch.manifestBytes)&&bound[1].sha256===hash(input.failedBatch.stateBytes)&&bound[2].sha256===hash(input.pendingBytes),'冻结证据与原题单、当前进度或保存意图字节不符');
+  const recheck=async({originalPending=true}={})=>{
+    assert(hash(await fs.readFile(await existingWorkspacePath(root,file)))===hash(bytes),'核对期间历史证据束已改变');
+    for(const item of bound)if(originalPending||item.pathname!==originalPendingPath)assert(hash(await fs.readFile(await existingWorkspacePath(root,item.pathname)))===item.sha256,'核对期间原题单、进度或保存意图已改变');
+  };
+  return {input,bundleSha256:hash(bytes),originalPendingPath,currentManifest,currentState,recheck};
+}
+
 /**
  * Independent Playwright executor for the teaching-content UI.
  * Each write uses the visible editor's native HTML paste or an explicitly chosen
@@ -54,8 +104,17 @@ function requestMatches(request, origin, pathname) {
  * lacks the server ID. Uncertain effects stop the batch for reconciliation.
  */
 export class NewSystemAdapter {
-  constructor({ baseDir, dataDir, profileDir, page = null, source = 'production', origin = SITE, timeout = 20000, inputMode = 'native-paste' } = {}) {
+  #pageObservation = null;
+  #liveAppendObservation = null;
+
+  constructor({ baseDir, dataDir, profileDir, page = null, source = 'production', origin = SITE, timeout = 20000, directoryTimeout = timeout, directoryRootTimeout = directoryTimeout, inputMode = 'native-paste', focusMode = 'foreground', windowMode = 'normal' } = {}) {
     if (!['native-paste', 'browser-command'].includes(inputMode)) throw new Error('inputMode 必须是 native-paste 或 browser-command');
+    this.focusMode = validateBrowserFocusMode(focusMode);
+    this.windowMode = validateBrowserWindowMode(windowMode);
+    if (this.focusMode === 'foreground' && this.windowMode === 'minimized') throw new Error('minimized 窗口只允许 background 模式');
+    if (this.focusMode === 'background' && inputMode !== 'browser-command') throw new Error('后台模式只支持 browser-command；原生剪贴板粘贴须使用 foreground');
+    if (!Number.isSafeInteger(directoryTimeout) || directoryTimeout < 1 || directoryTimeout > 120000) throw new Error('directoryTimeout 必须是 1–120000 毫秒的整数');
+    if (!Number.isSafeInteger(directoryRootTimeout) || directoryRootTimeout < 1 || directoryRootTimeout > 120000) throw new Error('directoryRootTimeout 必须是 1–120000 毫秒的整数');
     this.inputMode = inputMode;
     this.baseDir = path.resolve(baseDir ?? process.cwd());
     this.dataDir = path.resolve(dataDir ?? path.join(this.baseDir, 'data'));
@@ -63,6 +122,8 @@ export class NewSystemAdapter {
     this.source = source;
     this.origin = new URL(origin).origin;
     this.timeout = timeout;
+    this.directoryTimeout = directoryTimeout;
+    this.directoryRootTimeout = directoryRootTimeout;
     this.page = page;
     this.context = page?.context() ?? null;
     this.ownsContext = false;
@@ -83,11 +144,40 @@ export class NewSystemAdapter {
 
   _observe(page) {
     if (this._observedPage === page) return;
+    if (this.#pageObservation) this.#pageObservation.continuous = false;
     this._observedPage = page;
-    page.on('request', request => {
+    const context = page.context(), browser = context?.browser?.();
+    const observation = { page, context, browser, continuous:true, channels:[] };
+    const invalidate = () => { observation.continuous = false; };
+    observation.onRequest = request => {
       this._requests.set(request, ++this._sequence);
-      if (this._pendingWrite?.status === 'pending' && requestMatches(request, this.origin, SAVE_PATH) && request.method() === 'POST') this._pendingWrite.observedSaveRequests += 1;
-    });
+      if (requestMatches(request, this.origin, SAVE_PATH) && request.method() === 'POST') {
+        const live = this.#liveAppendObservation;
+        // Keep the fresh intent's count independent of recovery clones/status.
+        // A failed request or response never retracts a dispatched SAVE.
+        if (live?.observation === observation) {
+          live.observedSaveRequests += 1;
+          live.pending.observedSaveRequests = Math.max(live.pending.observedSaveRequests, live.observedSaveRequests);
+        }
+        if (this._pendingWrite?.status === 'pending' && this._pendingWrite !== live?.pending) this._pendingWrite.observedSaveRequests += 1;
+      }
+    };
+    observation.onClose = invalidate;
+    observation.onCrash = invalidate;
+    this.#pageObservation = observation;
+    const watch = (emitter, entries) => {
+      if (!emitter || typeof emitter.on !== 'function') { invalidate(); return; }
+      if (typeof emitter.listeners !== 'function') invalidate();
+      const removed = (event, listener) => {
+        if (entries.some(([name, fn]) => name === event && fn === listener)) invalidate();
+      };
+      // Two watchers detect removal of either watcher before any silent gap.
+      entries.push(['removeListener', removed], ['removeListener', (event, listener) => removed(event, listener)]);
+      for (const [event, listener] of entries) { emitter.on(event, listener); observation.channels.push([emitter, event, listener]); }
+    };
+    watch(page, [['request', observation.onRequest], ['close', observation.onClose], ['crash', observation.onCrash]]);
+    watch(context, [['close', invalidate]]);
+    watch(browser, [['disconnected', invalidate]]);
     page.on('framenavigated', frame => {
       if (frame === page.mainFrame()) {
         this._directoryKey = null;
@@ -95,6 +185,24 @@ export class NewSystemAdapter {
         this._nodeID = null;
       }
     });
+  }
+
+  #hasLiveAppendObservation(pending) {
+    const live = this.#liveAppendObservation, observed = this.#pageObservation;
+    if (!live || !observed) return false;
+    if (!observed.continuous) return false;
+    const listenersIntact = observed.channels.every(([emitter, event, listener]) => typeof emitter.listeners === 'function' && emitter.listeners(event).includes(listener));
+    const browser = observed.context?.browser?.();
+    const valid = observed.continuous && live.observation === observed
+      && this.page === observed.page && this._observedPage === observed.page
+      && this.context === observed.context && this.page.context() === observed.context
+      && !this.page.isClosed() && browser === observed.browser && typeof browser?.isConnected === 'function' && browser.isConnected() && listenersIntact
+      && pending === live.pending && this._pendingWrite === live.pending
+      && isDeepStrictEqual(appendIntentIdentity(pending), live.identity)
+      && !live.receiptConflict && pending.receiptConflict !== true
+      && Number.isSafeInteger(pending.observedSaveRequests) && pending.observedSaveRequests >= 0;
+    if (!valid) observed.continuous = false;
+    return Boolean(valid);
   }
 
   _captureSaveResponse(cursor=this._sequence,extraPredicate=()=>true) {
@@ -166,12 +274,20 @@ export class NewSystemAdapter {
     return selected.chapterLabel === label(target.chapterLabel) && selected.sectionLabel === label(target.sectionLabel);
   }
 
-  async _click(locator) {
-    // Reload can leave the extension's tab in the background. Re-select the
-    // guarded page before each pointer operation instead of relying on the
-    // once-per-command activation before that reload.
-    await this.page.bringToFront();
-    return checkedPointerClick(this.page, locator, { timeout:this.timeout, guard:() => this.guard({waitForEditors:false}) });
+  async _activate() {
+    return activateRecorderPage(this.page, this.focusMode, { windowMode:this.windowMode, guard:() => this.guard({waitForEditors:false}) });
+  }
+
+  async _click(locator, {preserveEditorFocus=false,beforeInput}={}) {
+    // Reapply the configured window policy after reload. Background input never
+    // falls back to a foreground window when its document loses actionability.
+    await this._activate();
+    const clicked = await checkedPointerClick(this.page, locator, { timeout:this.timeout, focusMode:this.focusMode, windowMode:this.windowMode, preserveEditorFocus, beforeInput, guard:async () => {
+      await this.guard({waitForEditors:false});
+      if (this.focusMode === 'background' && this.windowMode !== 'minimized') await this._requireDocumentFocus('后台点击前后');
+    } });
+    this._lastPointerClick = clicked;
+    return clicked;
   }
 
   async _stableList(expected) {
@@ -196,12 +312,33 @@ export class NewSystemAdapter {
     throw new Error('目录的异步题目列表未完成加载，拒绝使用旧列表');
   }
 
+  async _reloadForFreshRead() {
+    await this.guard({waitForEditors:false});
+    // Discard cached server data even when navigation subsequently fails.
+    this._directoryKey=null;this._directoryRecords=[];this._nodeID=null;
+    // The platform can show its directory before DOMContentLoaded completes.
+    // A committed navigation is followed by the existing visible-directory
+    // waits, a NEW click-caused LIST request and full scope/ID/content checks.
+    // Never catch a navigation error or treat the old DOM/cache as evidence.
+    await this.page.reload({waitUntil:'commit',timeout:this.timeout});
+    if (this.focusMode === 'background' && this.windowMode === 'minimized') {
+      // The SPA replaces its title when the book finishes loading. Wait for the
+      // real new directory before applying the temporary Win32 window marker.
+      await this.guard({waitForEditors:false});
+      await waitVisibleByTimer(this.page.locator('.el-tree-node__content').first(), {
+        timeout:this.directoryRootTimeout, name:'刷新后的教材目录', targetRole:'directory-root',
+      });
+    }
+    await this._activate();
+    await this.guard({waitForEditors:false});
+  }
+
   async directory(task) {
     const target = this._validateTarget(task);
     // Reload may leave no section selected and both editors hidden. Validate
     // identity first; editor visibility becomes required after scope selection.
     await this.guard({ waitForEditors: false });
-    await this.page.bringToFront();
+    await this._activate();
     if (this._directoryKey === scopeKey(target) && await this._scopeMatches(target)) {
       await this._stableList(this._directoryRecords);
       await this.guard();
@@ -211,18 +348,13 @@ export class NewSystemAdapter {
     // has no authoritative cached list, so reload instead of waiting for a
     // request the UI has no reason to send. Never synthesize/replay an API call.
     if (await this._scopeMatches(target)) {
-      await this.page.reload({ waitUntil:'domcontentloaded' });
-      await this.page.bringToFront();
-      this._directoryKey = null;
-      this._directoryRecords = [];
-      this._nodeID = null;
-      await this.guard({ waitForEditors:false });
+      await this._reloadForFreshRead();
       if (await this._scopeMatches(target)) throw new Error('刷新后目录仍已选中且无可信列表，拒绝等待不存在的列表请求');
     }
     const chapter = this.page.locator('.el-tree-node__content').filter({ hasText: exactLabel(target.chapterLabel) });
     // The directory tree itself loads asynchronously after reload. An immediate
     // count of zero is not evidence that the chapter is absent.
-    await waitVisibleByTimer(chapter,{timeout:this.timeout,name:'章节 '+target.chapterLabel,targetRole:'directory-chapter'});
+    await waitVisibleByTimer(chapter,{timeout:this.directoryTimeout,name:'章节 '+target.chapterLabel,targetRole:'directory-chapter'});
     if (await chapter.count() !== 1) throw new Error('章节标签无法唯一匹配');
     const chapterNode = chapter.locator('xpath=..');
     const rootLeaf = label(target.chapterLabel) === label(target.sectionLabel) && await chapterNode.evaluate(node => !node.querySelector(':scope > .el-tree-node__children > .el-tree-node') && Boolean(node.querySelector(':scope > .el-tree-node__content .el-tree-node__expand-icon.is-leaf')));
@@ -235,19 +367,39 @@ export class NewSystemAdapter {
     // Missing section labels may still be loading inside an already expanded node.
     // Toggle only a visibly collapsed chapter, otherwise wait for the child label.
     if (!rootLeaf && !expanded) await this._click(chapter);
-    await waitVisibleByTimer(section,{timeout:this.timeout,name:'节目录 '+target.sectionLabel,targetRole:'directory-section'});
+    await waitVisibleByTimer(section,{timeout:this.directoryTimeout,name:'节目录 '+target.sectionLabel,targetRole:'directory-section'});
     if (await section.count() !== 1) throw new Error('该章节下的节标签无法唯一匹配');
     const cursor = this._sequence;
-    const responsePromise = this.page.waitForResponse(response => {
+    const observedList = captureResponseBeforeWait(this.page, {predicate:response => {
       const request = response.request();
       if ((this._requests.get(request) ?? 0) <= cursor || !requestMatches(request, this.origin, LIST_PATH)) return false;
       const url = new URL(request.url());
       return Number(url.searchParams.get('textbookID')) === this.bookId && positive(url.searchParams.get('nodeID'));
-    }, { timeout: this.timeout });
-    // Handle rejection immediately, including when click itself throws.
-    responsePromise.catch(() => {});
-    await this._click(section);
-    const response = await responsePromise;
+    }, timeoutMs:this.timeout});
+    let response;
+    const clickStartedAt = Date.now();
+    try {
+      await this._click(section);
+      response = await observedList.wait();
+    } catch (error) {
+      // Read-only evidence distinguishes input checks from the response wait.
+      error.directoryClickElapsedMs = Date.now() - clickStartedAt;
+      error.selectedScopeAfterClick = await this._selectedScope();
+      if(this.focusMode==='background'&&this.windowMode==='minimized') {
+        await this.guard({waitForEditors:false});
+        const dom=await this.page.evaluate(()=>({
+          readyState:document.readyState,visibilityState:document.visibilityState,hasFocus:document.hasFocus(),
+          selectedLabels:[...document.querySelectorAll('.el-tree-node.is-current > .el-tree-node__content')].map(e=>e.innerText),
+          sectionLabels:[...document.querySelectorAll('.el-tree-node__content')].map(e=>({text:e.innerText,visible:!!e.getClientRects().length})),
+          recordNumbers:[...document.querySelectorAll('.shiti-cont .shiti-sort')].map(e=>e.innerText),
+        }));
+        const folder=path.join(this.dataDir,'directory-input-diagnostics');await fs.mkdir(folder,{recursive:true});
+        const file=path.join(folder,`book-${this.bookId}-${randomUUID()}.json`);
+        await fs.writeFile(file,JSON.stringify({bookId:this.bookId,target,at:new Date().toISOString(),elapsedMs:error.directoryClickElapsedMs,selectedScope:error.selectedScopeAfterClick,pointer:error.nativePointer??this._lastPointerClick,dom},null,2),{flag:'wx'});
+        error.message += '；只读目录输入诊断：'+file;
+      }
+      throw error;
+    } finally { observedList.dispose(); }
     const body = await response.json();
     if (!response.ok() || body?.errno !== 0 || body.errmsg !== 'success' || !Array.isArray(body.data)) throw new Error('平台题目列表业务响应未确认成功');
     if (!await this._scopeMatches(target)) throw new Error('题目列表响应到达时选中目录已改变');
@@ -433,6 +585,8 @@ export class NewSystemAdapter {
         })),
       };
     });
+    const native = await this.page.locator(selector).evaluate(readEditorNativeEmphasis);
+    result.paragraphs.forEach((paragraph,index)=>{paragraph.nativeEmphasis=native[index];});
     for (const image of result.images) image.sha256 = await this._hashImage(image.src);
     return result;
   }
@@ -508,12 +662,34 @@ export class NewSystemAdapter {
     this._validateTarget(task);
     const reload=async()=>{
       // A refresh is valid even when the current page has no selected section.
-      await this.guard({ waitForEditors: false });
-      await this.page.reload({ waitUntil: 'domcontentloaded' });
-      await this.page.bringToFront();
-      this._directoryKey = null;this._directoryRecords=[];this._nodeID=null;
+      await this._reloadForFreshRead();
     };
-    if (refresh) await reload();
+    if (refresh) {
+      try { await reload(); }
+      catch (error) {
+        if (error?.code === 'TARGET_VISIBILITY_TIMEOUT' && error.targetRole === 'directory-root') {
+          // The root wait precedes the ordinary directory-selection catch.
+          // Preserve evidence without another reload, click, Plus, or save.
+          try {
+            const diagnostic = await this._captureDirectoryVisibilityDiagnostic(task,error,1);
+            diagnostic.phase = 'refresh-directory-root';
+            diagnostic.savedReceiptBound = this._savedPendingMatchesRead(task);
+            diagnostic.prewriteEmptyTreeRetryEligible = false;
+            error.directoryVisibilityEvidencePath = await this._persistDirectoryVisibilityDiagnostic(task,diagnostic);
+          } catch (captureError) {
+            if (captureError.directoryVisibilityDiagnostic) {
+              const partial = captureError.directoryVisibilityDiagnostic;
+              partial.phase = 'refresh-directory-root';
+              partial.prewriteEmptyTreeRetryEligible = false;
+              try { error.directoryVisibilityEvidencePath = await this._persistDirectoryVisibilityDiagnostic(task,partial); }
+              catch (persistError) { error.directoryDiagnosticPersistenceError = persistError.message; }
+            }
+            error.directoryDiagnosticError = captureError.message;
+          }
+        }
+        throw error;
+      }
+    }
     const visibilityTimeout=error=>error?.code==='TARGET_VISIBILITY_TIMEOUT' && ['directory-chapter','directory-section'].includes(error.targetRole);
     try {await this.directory(task);}
     catch(firstError) {
@@ -561,10 +737,13 @@ export class NewSystemAdapter {
     const stem = await this._editorRead('#contentedit .w-e-text');
     const answer = await this._editorRead('#answeredit .w-e-text');
     if (!await this._scopeMatches(target)) throw new Error('回读完成前目录发生变化');
+    const windowCheck = this.focusMode==='background'&&this.windowMode==='minimized'
+      ? {...await this._requireDocumentFocus('回读完成后'),checkedAt:new Date().toISOString()} : null;
     return {
       status: 'found', ...base, recordId: record.shitiID, stem, answer,
       mainPicNum: record.mainPicNum, answerPicNum: record.answerPicNum,
       source: { pages: [record.mainPicNum], answerPages: [record.answerPicNum] }, haveAnswer: record.haveAnswer,
+      ...(windowCheck?{windowCheck}:{}),
     };
   }
 
@@ -579,7 +758,8 @@ export class NewSystemAdapter {
         src: document.querySelectorAll('.cropper-box-canvas img[alt="cropper-img"]')[side]?.src,
       }), side);
       await inputs.nth(side).fill(String(pages[side]));
-      await inputs.nth(side).press('Tab');
+      if(this.focusMode==='background'&&this.windowMode==='minimized')await this._click(inputs.nth(1-side));
+      else await inputs.nth(side).press('Tab');
       await this.page.waitForFunction(({ side, number, before }) => {
         const inputs = document.querySelectorAll('input.el-input__inner');
         const images = document.querySelectorAll('.cropper-box-canvas img[alt="cropper-img"]');
@@ -597,9 +777,13 @@ export class NewSystemAdapter {
   async _writeSystemClipboard(payload) { return writeWindowsClipboardHtml(payload); }
 
   async _requireDocumentFocus(stage) {
+    if (this.focusMode === 'background') {
+      try { return await requireRecorderDocumentReady(this.page, {focusMode:this.focusMode,windowMode:this.windowMode,guard:()=>this.guard({waitForEditors:false})}); }
+      catch (error) { throw new Error(`${stage}: ${error.message}`); }
+    }
     // A document-level guard only: prior CUA attachment can enable focus
     // emulation, so hasFocus() does not prove the real Windows foreground window.
-    if (!await this.page.evaluate(() => document.hasFocus())) throw new Error(`${stage}: 录入网页没有文档焦点，请保持原 Edge 页面处于前台`);
+    if (!await this.page.evaluate(() => document.visibilityState === 'visible' && document.hasFocus())) throw new Error(`${stage}: 录入网页隐藏或没有文档焦点，${this.focusMode === 'background' ? '后台模式已停止且不会自动前置窗口，请检查原 Edge 页面' : '请保持原 Edge 页面处于前台'}`);
   }
 
   async _writeClipboard(html) {
@@ -628,7 +812,7 @@ export class NewSystemAdapter {
   async _clipboardPreflight(html) {
     if (this.inputMode === 'browser-command') {
       await this.guard();
-      await this.page.bringToFront();
+      await this._activate();
       await this._requireDocumentFocus('浏览器编辑命令预检前（尚未新增题目）');
       const capable = await this.page.evaluate(() => {
         const selectors = ['#contentedit .w-e-text', '#answeredit .w-e-text'];
@@ -642,7 +826,7 @@ export class NewSystemAdapter {
       if (!capable) throw new Error('浏览器编辑命令或两个编辑框能力未确认，尚未新增题目');
       return;
     }
-    await this.page.bringToFront();
+    await this._activate();
     if (this.usesSystemClipboard) {
       await this._requireDocumentFocus('剪贴板预检前');
       try { await this._writeClipboard(html); }
@@ -666,14 +850,14 @@ export class NewSystemAdapter {
   async _paste(selector, html, { replace = false } = {}) {
     if (this.inputMode === 'browser-command') {
       await this.guard();
-      return insertReviewedEditorHtml(this.page, selector, html, { replace, timeoutMs:this.timeout, guard:() => this.guard() });
+      return insertReviewedEditorHtml(this.page, selector, html, { replace, timeoutMs:this.timeout, guard:() => this.guard(), focusMode:this.focusMode, windowMode:this.windowMode });
     }
-    await this.page.bringToFront();
+    await this._activate();
     await this._requireDocumentFocus('原生粘贴准备');
     await this._writeClipboard(html);
     // The hidden native clipboard helper is a separate Windows process.
     // Re-activate the target tab after it returns, as in the successful probe.
-    await this.page.bringToFront();
+    await this._activate();
     const editor = this.page.locator(selector);
     await this._click(editor);
     await this._requireDocumentFocus('原生粘贴前');
@@ -694,6 +878,58 @@ export class NewSystemAdapter {
       const clean = text => text.replace(/\s+/gu, '');
       return clean(actual.textContent) === clean(expected.textContent) && actual.querySelectorAll('img').length === expected.querySelectorAll('img').length;
     }, { selector, html }, { timeout: this.timeout, polling:80 });
+    await assertEditorNativeEmphasis(this.page,selector,html);
+  }
+
+  /** Reviewed answer content with the platform's own Add Analysis menu. */
+  async _pasteReviewedAnswer(answer, {replace=false}={}) {
+    const indices=answer.blocks.flatMap((block,index)=>block.type==='analysis-separator'?[index]:[]);
+    if(!indices.length){await this._paste('#answeredit .w-e-text',renderEditorHtml(answer,this.baseDir),{replace});return {analysisButtonClicks:0};}
+    if(indices.length!==1)throw new Error('答案只能含一个解析分隔标记');
+    const index=indices[0],selector='#answeredit .w-e-text';
+    if(this.focusMode==='background'&&this.windowMode==='minimized'){
+      // Hidden windows do not reliably deliver the keyboard events wangEditor
+      // uses to cache its toolbar selection. Insert the already reviewed fixed
+      // platform marker with the same confined browser editing command as text.
+      // This invokes ordinary editor input/autosave, not framework or save APIs.
+      await this._paste(selector,renderEditorHtml(answer,this.baseDir),{replace});
+      await this.page.waitForFunction(selector=>{
+        const images=[...document.querySelector(selector).querySelectorAll('img')];
+        return images.length>0&&images.every(image=>image.complete&&image.naturalWidth>0&&image.naturalHeight>0);
+      },selector,{timeout:this.timeout,polling:80});
+      return {analysisButtonClicks:0,analysisSeparatorCount:1,analysisInputMethod:'browser-command-reviewed-native-image'};
+    }
+    const placeholder='<p style="text-align:left;direction:ltr" dir="ltr" align="left"><br></p>';
+    const html=renderEditorHtml({blocks:answer.blocks.slice(0,index)},this.baseDir)+placeholder+renderEditorHtml({blocks:answer.blocks.slice(index+1)},this.baseDir);
+    await this._paste(selector,html,{replace});
+    const editor=this.page.locator(selector);
+    await editor.evaluate((element,index)=>{
+      const paragraph=element.children[index];
+      if(!paragraph||paragraph.tagName!=='P'||paragraph.textContent.trim()||paragraph.querySelector('img,svg,math-tex,.formula-node'))throw new Error('解析插入位置与已审答案不一致');
+      element.focus();const range=document.createRange();range.selectNodeContents(paragraph);range.collapse(true);
+      const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);
+    },index);
+    await this.page.keyboard.press('Shift');
+    await editor.evaluate((element,index)=>{
+      const selection=window.getSelection(),paragraph=element.children[index];
+      if(document.activeElement!==element||!selection?.isCollapsed||selection.rangeCount!==1||!paragraph.contains(selection.anchorNode)||!paragraph.contains(selection.focusNode))throw new Error('原生解析按钮的光标位置不正确');
+    },index);
+    await this._click(this.page.locator('#answeredit .w-e-menu').filter({hasText:/^\s*添加解析\s*$/u}));
+    const expected=renderEditorHtml(answer,this.baseDir);
+    await this.page.waitForFunction(({selector,html})=>{
+      const actual=document.querySelector(selector),expected=document.createElement('div');expected.innerHTML=html;
+      if(!actual)return false;
+      const useful=element=>[...element.children].filter(child=>child.textContent.trim()||child.querySelector('img'));
+      const got=useful(actual),want=useful(expected);
+      const normalize=value=>value.replace(/[\s\u200b]+/gu,'');
+      if(got.length!==want.length)return false;
+      return got.every((paragraph,i)=>{
+        const images=[...paragraph.querySelectorAll('img')],wanted=[...want[i].querySelectorAll('img')];
+        return normalize(paragraph.textContent)===normalize(want[i].textContent)&&images.length===wanted.length&&images.every((image,j)=>image.src===wanted[j].src&&image.complete&&image.naturalWidth>0&&image.naturalHeight>0);
+      });
+    },{selector,html:expected},{timeout:this.timeout,polling:80});
+    await assertEditorNativeEmphasis(this.page,selector,expected);
+    return {analysisButtonClicks:1};
   }
 
   /** Explicitly authorized answer correction; ordinary batches never overwrite. */
@@ -725,7 +961,8 @@ export class NewSystemAdapter {
         saveResponse=this._captureSaveResponse(cursor);
         phase = 'replace-answer-native-paste';
         edited = true;
-        await this._paste('#answeredit .w-e-text', html, {replace:true});
+        const formatInput=await this._pasteReviewedAnswer(task.answer,{replace:true});
+        await checkpoint({phase:'answer-format-input',...formatInput});
         await this._click(this.page.locator('input.el-input__inner').nth(0));
         phase = 'answer-save-business-receipt';
         const response=await saveResponse.wait();
@@ -745,7 +982,7 @@ export class NewSystemAdapter {
         const withoutTargetAnswer=records=>records.map(r=>r.seqIndex===task.target.record?{...r,answer:null}:r);
         if (!isDeepStrictEqual(withoutTargetAnswer(priorRecords),withoutTargetAnswer(this._directoryRecords))) throw new Error('答案修正改变了其他题目或本题题干、来源、身份');
         receipt.preservedRecords=count;
-        return {receipt,readback,comparison,saveRequests:saves.length,preservedRecords:count,plusClicks:0};
+        return {receipt,readback,comparison,saveRequests:saves.length,preservedRecords:count,plusClicks:0,...formatInput};
       } finally {saveResponse?.dispose();this.page.off('request',observe);}
     } catch(error) {
       if(edited)this._uncertain=true;
@@ -774,6 +1011,7 @@ export class NewSystemAdapter {
     this._busy = true;
     let created = false;
     let saveResponse=null;
+    let appendInput=null,modelReadiness=null,saveTrigger=null;
     let phase = 'directory';
     try {
       await this.directory(task);
@@ -789,9 +1027,19 @@ export class NewSystemAdapter {
       const answerHtml = await renderEditorHtml(task.answer, this.baseDir);
       phase = 'clipboard-preflight';
       await this._clipboardPreflight(answerHtml);
-      this._pendingWrite = { schemaVersion:1, kind:'new-system-append-recovery', status:'pending', bookId:this.bookId, nodeID:this._nodeID, task:structuredClone(task), priorRecords, phase:'before-plus', created:false, observedSaveRequests:0, receipt:null, startedAt:new Date().toISOString() };
+      const freshPending = { schemaVersion:1, kind:'new-system-append-recovery', status:'pending', bookId:this.bookId, nodeID:this._nodeID, task:structuredClone(task), priorRecords, phase:'before-plus', created:false, observedSaveRequests:0, receipt:null, startedAt:new Date().toISOString(), evidencePath:path.join(path.resolve(this.dataDir,'new-system-recovery'),`book-${this.bookId}-${randomUUID()}.pending.json`) };
+      const freshIdentity = structuredClone(appendIntentIdentity(freshPending)), freshObservation = this.#pageObservation;
+      this._pendingWrite = freshPending;
       phase = 'durable-write-intent';
       await this._persistPendingWrite(); // Durable before any draft or editing.
+      if (this._pendingWrite !== freshPending || !isDeepStrictEqual(appendIntentIdentity(freshPending),freshIdentity)
+        || this.#pageObservation !== freshObservation || this.page !== freshObservation?.page || this.context !== freshObservation?.context) {
+        this.#liveAppendObservation = null; this._uncertain = true;
+        throw new Error('保存原始意图期间对象或页面观察已改变，保留写入锁');
+      }
+      // This capability exists only for a fresh append, never deserialization.
+      this.#liveAppendObservation = { pending:freshPending, observation:freshObservation,
+        identity:freshIdentity, observedSaveRequests:freshPending.observedSaveRequests };
       const cursor = this._sequence;
       saveResponse=this._captureSaveResponse(cursor);
       phase = 'create-draft';
@@ -808,13 +1056,44 @@ export class NewSystemAdapter {
       }), null, { timeout: this.timeout, polling:80 });
       // Answer first: it must remain unsaved until the complete stem is pasted.
       phase = 'answer-native-paste-readback';
-      await this._paste('#answeredit .w-e-text', answerHtml);
+      const answerInput=await this._pasteReviewedAnswer(task.answer);
       phase = 'stem-native-paste-readback';
-      await this._paste('#contentedit .w-e-text', stemHtml);
-      // wangEditor handles Tab as an insertion command. Blur by clicking the
-      // already verified source-page input instead, without changing its value.
-      phase = 'save-business-receipt';
-      await this._click(this.page.locator('input.el-input__inner').nth(0));
+      const stemInput=await this._paste('#contentedit .w-e-text', stemHtml);
+      appendInput={answer:answerInput??null,stem:stemInput??null};
+      // Normal windows save through the verified source-input blur. Minimized
+      // windows await the application model and activate the actual Save UI.
+      if(this.focusMode==='background'&&this.windowMode==='minimized'){
+        const requireNoEarlierSave=()=>{
+          if(this._pendingWrite!==freshPending||freshPending.observedSaveRequests!==0||freshPending.receipt||freshPending.receiptConflict)
+            throw new Error('新增保存之前已观察到保存或意图改变，保留写入锁');
+        };
+        requireNoEarlierSave();
+        phase='append-model-readiness';
+        modelReadiness=await waitForAppendAutosaveReady(this,task,{stemHtml,answerHtml,mainPicNum,answerPicNum});
+        requireNoEarlierSave();
+        freshPending.appendInput=structuredClone(appendInput);
+        freshPending.modelReadiness=structuredClone(modelReadiness);
+        await this._persistPendingWrite();
+        requireNoEarlierSave();
+        // Activate the real Save UI once while retaining the stem focus. Moving
+        // focus to this button would also run the platform's native blur save.
+        phase='save-business-receipt';
+        saveTrigger=await this._click(this.page.locator('button.top-btn').filter({hasText:/^\s*保存\s*$/u}),{preserveEditorFocus:true,beforeInput:async()=>{
+          requireNoEarlierSave();
+          const snapshot=await this.page.evaluate(readAppendAutosaveSnapshot,{bookId:this.bookId,nodeID:this._nodeID,record:number,
+            mainPicNum,answerPicNum,stemHtml,answerHtml,priorRecordIds:priorRecords.map(record=>record.shitiID)});
+          requireNoEarlierSave();
+          if(snapshot.ready!==true||snapshot.fatal.length||snapshot.differences.length||!isDeepStrictEqual(snapshot.identity,modelReadiness.identity)
+            ||snapshot.url!==modelReadiness.windowCheck.url||snapshot.timeOrigin!==modelReadiness.windowCheck.timeOrigin){
+            const error=new Error('保存按钮点击之前模型、已审内容或页面绑定改变，保留写入锁');
+            error.appendModelReadiness={lastSnapshot:snapshot,windowCheck:modelReadiness.windowCheck};throw error;
+          }
+        }});
+        freshPending.saveTrigger=structuredClone(saveTrigger);
+      }else{
+        phase = 'save-business-receipt';
+        saveTrigger=await this._click(this.page.locator('input.el-input__inner').nth(0));
+      }
       const response = await saveResponse.wait();
       const requestBody = parsePost(response.request());
       const request = reducedRequest(requestBody);
@@ -825,6 +1104,7 @@ export class NewSystemAdapter {
       const receipt = {
         bookId: this.bookId, seqIndex: number, shitiID: recordID, mainPicNum, answerPicNum,
         request, response: { status: response.status(), body: { errno: body.errno, errmsg: body.errmsg, data: { seqIndex: Number(body.data.seqIndex), shitiID: recordID, haveAnswer: body.data.haveAnswer } } },
+        ...(modelReadiness?{appendInput,modelReadiness,saveTrigger}:{}),
       };
       phase = 'receipt-checkpoint';
       this._pendingWrite.receipt = structuredClone(receipt);
@@ -847,6 +1127,44 @@ export class NewSystemAdapter {
       return receipt;
     } catch (error) {
       if (created) this._uncertain = true;
+      if(modelReadiness||error.appendModelReadiness||phase==='append-model-readiness'||this.focusMode==='background'&&this.windowMode==='minimized'&&phase==='save-business-receipt'){
+        try{
+          const folder=path.resolve(this.dataDir,'append-save-input-diagnostics');await fs.mkdir(folder,{recursive:true});
+          const diagnosticPath=path.join(folder,`book-${this.bookId}-${randomUUID()}.json`);
+          await fs.writeFile(diagnosticPath,JSON.stringify({schemaVersion:1,kind:'new-system-append-save-input-diagnostic',bookId:this.bookId,taskId:task.id,
+            phase,error:error.message,capturedAt:new Date().toISOString(),appendInput,modelReadiness,readinessFailure:error.appendModelReadiness??null,
+            saveTrigger:saveTrigger??error.nativePointer??null,observedSaveRequests:this._pendingWrite?.observedSaveRequests??null},null,2),{flag:'wx'});
+          if(this._pendingWrite)this._pendingWrite.inputDiagnosticPath=diagnosticPath;
+        }catch(diagnosticError){error.diagnosticError=diagnosticError.message;}
+      }
+      if (phase === 'answer-native-paste-readback') {
+        // Preserve the failed draft before recovery reloads it. Read only the
+        // owned answer editor and its selection; never inspect other tabs.
+        try {
+          const snapshot = await this.page.evaluate(() => {
+            const editor = document.querySelector('#answeredit .w-e-text');
+            const selection = window.getSelection();
+            return {
+              url:location.href, timeOrigin:performance.timeOrigin,
+              visibilityState:document.visibilityState, hasFocus:document.hasFocus(),
+              answerHtml:editor?.innerHTML ?? null,
+              activeEditor:document.activeElement === editor,
+              selection:selection ? {
+                rangeCount:selection.rangeCount, collapsed:selection.isCollapsed,
+                anchorInEditor:Boolean(editor?.contains(selection.anchorNode)),
+                focusInEditor:Boolean(editor?.contains(selection.focusNode)),
+                anchorOffset:selection.anchorOffset, focusOffset:selection.focusOffset,
+              } : null,
+              images:[...(editor?.querySelectorAll('img') ?? [])].map(image => ({src:image.src,complete:image.complete,width:image.naturalWidth,height:image.naturalHeight})),
+            };
+          });
+          const folder = path.resolve(this.dataDir, 'answer-input-diagnostics');
+          await fs.mkdir(folder, {recursive:true});
+          const diagnosticPath = path.join(folder, `book-${this.bookId}-${randomUUID()}.json`);
+          await fs.writeFile(diagnosticPath, JSON.stringify({bookId:this.bookId,taskId:task.id,phase,error:error.message,capturedAt:new Date().toISOString(),snapshot},null,2), {flag:'wx'});
+          if (this._pendingWrite) this._pendingWrite.inputDiagnosticPath = diagnosticPath;
+        } catch (diagnosticError) { error.diagnosticError = diagnosticError.message; }
+      }
       if (this._pendingWrite?.status === 'pending') {
         this._pendingWrite.phase = phase;
         this._pendingWrite.created = created;
@@ -860,8 +1178,90 @@ export class NewSystemAdapter {
     } finally { saveResponse?.dispose();this._busy = false; }
   }
 
+  async reconcileHistoricalNetwork(task, {root,context,pendingPath,historicalNetworkEvidencePath,evidencePath,promote,validatorProfile}={}) {
+    if(this._busy)throw new Error('写入仍在执行，不能并发历史核对');
+    if(validatorProfile!==undefined&&this.source!=='fixture')throw new Error('生产历史核对不接受自定义证明规则');
+    if(typeof promote!=='function')throw new Error('历史核对必须持有程序进度事务检查点');
+    this._uncertain=true;this._busy=true;
+    const page=this.page, browserContext=page?.context(), browser=browserContext?.browser?.(), channels=[];
+    let continuous=true, saves=0,recoveryPending=null;
+    const assert=(condition,message)=>{if(!condition)throw new Error(message);};
+    const invalidate=()=>{continuous=false;};
+    const watch=(emitter,entries)=>{
+      assert(emitter&&['on','off','listeners'].every(key=>typeof emitter[key]==='function'),'当前历史核对缺少独立页面观察能力');
+      const removed=(event,listener)=>{if(entries.some(([name,fn])=>name===event&&fn===listener))invalidate();};
+      entries.push(['removeListener',removed],['removeListener',(event,listener)=>removed(event,listener)]);
+      for(const [event,listener] of entries){emitter.on(event,listener);channels.push([emitter,event,listener]);}
+    };
+    const check=()=>assert(continuous&&saves===0&&this.page===page&&this.context===browserContext&&page.context()===browserContext
+      &&browserContext.browser()===browser&&browser.isConnected()&&!page.isClosed()
+      &&channels.every(([emitter,event,listener])=>emitter.listeners(event).includes(listener)),'历史核对期间页面/连接观察改变或出现新的保存请求，保留写入锁');
+    try {
+      watch(page,[['request',request=>{if(request.method()==='POST'&&requestMatches(request,this.origin,SAVE_PATH))saves++;}],['close',invalidate],['crash',invalidate]]);
+      watch(browserContext,[['close',invalidate]]);watch(browser,[['disconnected',invalidate]]);check();
+      await this.guard({waitForEditors:false});check();
+      const frozen=await readHistoricalNetworkEvidence(root,historicalNetworkEvidencePath,{context,pendingPath});check();
+      const validation=validateHistoricalNetworkRecovery(frozen.input,validatorProfile===undefined?{}:{profile:validatorProfile});
+      assert(validation.valid&&validation.proof,'冻结原MCP历史不能证明未发送保存：'+validation.errors.join('; '));
+      const pending=JSON.parse(frozen.input.pendingBytes),candidate=validation.proof;
+      assert(pending.bookId===this.bookId&&isDeepStrictEqual(pending.task,task)&&candidate.manifestHash===context.state.manifestHash
+        &&isDeepStrictEqual(JSON.parse(frozen.input.failedBatch.manifestBytes),context.manifest)
+        &&isDeepStrictEqual(JSON.parse(frozen.input.failedBatch.stateBytes),context.state),'历史证明没有绑定当前原任务/题单/进度');
+      assert(!pending.receipt&&!pending.receiptConflict&&(!this._pendingWrite||isDeepStrictEqual(appendIntentIdentity(this._pendingWrite),appendIntentIdentity(pending)))
+        &&!this._pendingWrite?.receipt&&!this._pendingWrite?.receiptConflict&&!this._pendingWrite?.observedSaveRequests&&!this.#liveAppendObservation?.observedSaveRequests,'当前意图或已知保存证据与历史未保存证明冲突');
+      assert(await writableWorkspacePath(root,pending.evidencePath)===frozen.originalPendingPath,'原保存意图证据路径未绑定原文件');check();recoveryPending=pending;
+      const found=await this.read(task,{refresh:true});check();
+      assert(found.status==='missing'&&found.bookId===this.bookId&&found.count===pending.priorRecords.length&&this._nodeID===pending.nodeID
+        &&isDeepStrictEqual(found.target,task.target)&&isDeepStrictEqual(this._directoryRecords,pending.priorRecords),'当前刷新后目标题或完整原目录基线改变');
+      await frozen.recheck();check();
+      const output=await writableWorkspacePath(root,evidencePath),checkedAt=new Date().toISOString();
+      const historicalNetworkProof={...candidate,bundleSha256:frozen.bundleSha256,originalPendingPath:frozen.originalPendingPath,
+        currentManifest:frozen.currentManifest,currentState:frozen.currentState,
+        freshConfirmation:{schemaVersion:1,kind:'fresh-read-after-frozen-network-history',checkedAt,nodeID:pending.nodeID,
+          priorRecordIds:pending.priorRecords.map(record=>record.shitiID),targetMissing:true,priorRecordsUnchanged:true,noNewSaveObserved:true,evidencePath:output}};
+      const result={...found,recovery:{outcome:'not_saved',writeUnlocked:true,bookId:this.bookId,taskId:task.id,recordId:null,nodeID:pending.nodeID,
+        priorRecordIds:pending.priorRecords.map(record=>record.shitiID),priorRecordsUnchanged:true,targetRecordUnique:false,fullContentCompared:false,
+        liveNoSaveRequests:false,historicalNetworkProof,evidencePath:output}};
+      assert(validHistoricalNetworkRecoveryProof(historicalNetworkProof,{bookId:this.bookId,taskId:task.id,target:task.target,manifestHash:context.state.manifestHash,...(validatorProfile===undefined?{}:{profile:validatorProfile})}),'历史核对最终证明字段不完整');
+      // Reserve a distinct audit path without publishing an unlock before the
+      // pending and program-state transaction has actually completed.
+      const unknown=()=>({...found,recovery:{outcome:'unknown',writeUnlocked:false,bookId:this.bookId,taskId:task.id,evidencePath:output}});
+      await fs.writeFile(output,JSON.stringify(unknown(),null,2),{flag:'wx'});check();
+      await frozen.recheck();check();
+      // Historical qualification does not create a fresh append capability.
+      this._pendingWrite=structuredClone(pending);this._pendingWrite.status='reconciled';
+      this._pendingWrite.recovery={outcome:'not_saved',recordId:null,checkedAt,historicalNetworkProof};
+      let rollback;
+      try {
+        await this._persistPendingWrite();check();
+        await frozen.recheck({originalPending:false});check();
+        rollback=await promote(result,check);assert(typeof rollback==='function','历史核对缺少原进度事务回退保护');check();
+        await fs.writeFile(output,JSON.stringify(result,null,2));check();
+      } catch(error) {
+        this._pendingWrite.status='pending';this._pendingWrite.recovery={outcome:'unknown',errors:[error.message],checkedAt:new Date().toISOString()};
+        this._pendingWrite.observedSaveRequests=Math.max(this._pendingWrite.observedSaveRequests,saves);
+        try {await this._persistPendingWrite();await fs.writeFile(output,JSON.stringify(unknown(),null,2));}
+        finally {if(rollback)await rollback(error);}
+        throw error;
+      }
+      this._uncertain=false;
+      return result;
+    } catch(error) {
+      if(recoveryPending&&(saves>0||!continuous)){
+        this._pendingWrite??=structuredClone(recoveryPending);this._pendingWrite.status='pending';
+        this._pendingWrite.observedSaveRequests=Math.max(this._pendingWrite.observedSaveRequests,saves);
+        this._pendingWrite.recovery={outcome:'unknown',errors:[error.message],checkedAt:new Date().toISOString()};
+        await this._persistPendingWrite();
+      }
+      throw error;
+    } finally {for(const [emitter,event,listener] of channels)emitter.off(event,listener);this._busy=false;}
+  }
+
   async reconcile(task, options = {}) {
     if (this._busy) throw new Error('写入仍在执行，不能并发恢复');
+    const live = this.#liveAppendObservation;
+    // Latch an observed mutation/gap even when validation below rejects early.
+    if (live) this.#hasLiveAppendObservation(live.pending);
     const supplied = options.pendingWrite;
     const pending = supplied ?? this._pendingWrite;
     if (!pending || (!supplied && !this._uncertain && pending.status !== 'pending')) return this.read(task, { ...options, refresh:true });
@@ -873,8 +1273,35 @@ export class NewSystemAdapter {
       if (record.seqIndex !== index + 1 || !positive(record.shitiID) || ids.has(record.shitiID) || record.nodeID !== pending.nodeID || !positive(record.mainPicNum) || !positive(record.answerPicNum) || typeof record.question !== 'string' || typeof record.answer !== 'string' || typeof record.haveAnswer !== 'boolean') throw new Error('待恢复原记录身份、完整内容或来源无效，保留写入锁');
       ids.add(record.shitiID);
     }
-    const liveObservation = !supplied && pending === this._pendingWrite;
-    this._pendingWrite = structuredClone(pending);
+    const sameLiveIdentity = live && isDeepStrictEqual(appendIntentIdentity(pending),live.identity)
+      && isDeepStrictEqual(appendIntentIdentity(live.pending),live.identity);
+    if (sameLiveIdentity) {
+      live.observedSaveRequests = Math.max(live.observedSaveRequests,
+        Number.isSafeInteger(live.pending.observedSaveRequests) ? live.pending.observedSaveRequests : 0, pending.observedSaveRequests);
+      live.pending.observedSaveRequests = live.observedSaveRequests;
+      if (pending.receipt && !live.pending.receipt) live.pending.receipt = structuredClone(pending.receipt);
+      else if (pending.receipt && !isDeepStrictEqual(pending.receipt,live.pending.receipt)) {
+        live.receiptConflict = true; live.observation.continuous = false;
+      }
+      if (pending.receiptConflict === true || live.pending.receiptConflict === true || live.receiptConflict) {
+        live.receiptConflict = true; live.pending.receiptConflict = true; live.observation.continuous = false;
+      }
+    }
+    // A continuity gap removes the no-SAVE capability, not a known receipt.
+    const retainedReceipt = sameLiveIdentity ? live.pending.receipt : null;
+    const liveObservation = this.#hasLiveAppendObservation(live?.pending)
+      && isDeepStrictEqual(appendIntentIdentity(pending), live.identity);
+    if (liveObservation) {
+      live.observedSaveRequests = Math.max(live.observedSaveRequests, live.pending.observedSaveRequests, pending.observedSaveRequests);
+      live.pending.observedSaveRequests = live.observedSaveRequests;
+      this._pendingWrite = live.pending;
+    } else {
+      if (live) live.observation.continuous = false;
+      this._pendingWrite = structuredClone(pending);
+      if (sameLiveIdentity) this._pendingWrite.observedSaveRequests = live.observedSaveRequests;
+      if (sameLiveIdentity && live.receiptConflict) this._pendingWrite.receiptConflict = true;
+      if (!this._pendingWrite.receipt && retainedReceipt) this._pendingWrite.receipt = structuredClone(retainedReceipt);
+    }
     this._pendingWrite.status = 'pending'; // Re-prove restored confirmations too.
     const result = await this.read(task, { refresh:true });
     const current = this._directoryRecords;
@@ -883,17 +1310,18 @@ export class NewSystemAdapter {
     if (this._nodeID !== pending.nodeID || result.bookId !== pending.bookId || scopeKey(result.target) !== scopeKey(task.target)) errors.push('刷新目录或书籍身份改变');
     else if (result.status === 'missing') {
       if (!isDeepStrictEqual(current, prior) || result.count !== prior.length) errors.push('缺失目标但原列表发生变化');
-      else if (!liveObservation || this._pendingWrite.observedSaveRequests !== 0 || pending.receipt) errors.push('存在保存请求或已丢失同连接观察，不能证明未保存');
+      else if (!liveObservation || !this.#hasLiveAppendObservation(this._pendingWrite) || live.observedSaveRequests !== 0 || this._pendingWrite.observedSaveRequests !== 0 || this._pendingWrite.receipt || pending.receipt) errors.push('存在保存请求或已丢失同连接观察，不能证明未保存');
       else outcome = 'not_saved';
     } else if (result.status === 'found') {
+      if (this._pendingWrite.receiptConflict === true || sameLiveIdentity && live.receiptConflict) errors.push('同一保存意图存在相互冲突的已知回执，保留写入锁');
       if (current.length !== prior.length + 1 || !isDeepStrictEqual(current.slice(0, prior.length), prior)) errors.push('原记录完整内容、身份、顺序或来源改变');
       const added = current.at(-1);
       if (added?.seqIndex !== task.target.record || added?.nodeID !== pending.nodeID || added?.shitiID !== result.recordId || ids.has(result.recordId) || added?.mainPicNum !== task.source.pages[0] || added?.answerPicNum !== task.source.answerPages[0] || added?.haveAnswer !== true) errors.push('新增记录身份、来源或答案标记不符');
       const compared = compareNewSystemReadback(task, result, { baseDir:this.baseDir, bookId:this.bookId });
       errors.push(...compared.errors);
-      if (pending.receipt) {
-        errors.push(...verifyNewSystemSave(task, pending.receipt, { bookId:this.bookId }).errors);
-        if (pending.receipt.shitiID !== result.recordId) errors.push('保存回执与服务器ID不同');
+      for (const receipt of new Set([pending.receipt, this._pendingWrite.receipt, retainedReceipt].filter(Boolean))) {
+        errors.push(...verifyNewSystemSave(task, receipt, { bookId:this.bookId }).errors);
+        if (receipt.shitiID !== result.recordId) errors.push('保存回执与服务器ID不同');
       }
       if (!errors.length) outcome = 'saved';
     } else errors.push('刷新结果不明确');
@@ -905,11 +1333,20 @@ export class NewSystemAdapter {
     this._pendingWrite.status = 'reconciled';
     this._pendingWrite.recovery = { outcome, recordId:result.recordId ?? null, checkedAt:new Date().toISOString() };
     await this._persistPendingWrite();
+    // A SAVE or observation gap during the durable checkpoint cannot unlock.
+    if (outcome === 'not_saved' && (!this.#hasLiveAppendObservation(this._pendingWrite) || live.observedSaveRequests !== 0 || this._pendingWrite.observedSaveRequests !== 0 || this._pendingWrite.receipt)) {
+      this._pendingWrite.status = 'pending';
+      const errors = ['未保存证明持久化期间存在保存请求或连续观察已丢失，保留写入锁'];
+      this._pendingWrite.recovery = { outcome:'unknown', errors, checkedAt:new Date().toISOString() };
+      await this._persistPendingWrite();
+      return { ...result, recovery:{ outcome:'unknown', writeUnlocked:false, errors, evidencePath:this._pendingWrite.evidencePath } };
+    }
     this._uncertain = false; // Only after full proof and its durable checkpoint.
-    return { ...result, recovery:{ outcome, writeUnlocked:true, taskId:task.id, bookId:this.bookId, recordId:result.recordId ?? null, nodeID:pending.nodeID, priorRecordIds:prior.map(record=>record.shitiID), priorRecordsUnchanged:true, targetRecordUnique:outcome === 'saved', fullContentCompared:outcome === 'saved', liveNoSaveRequests:outcome === 'not_saved', evidencePath:this._pendingWrite.evidencePath, receiptKnown:Boolean(pending.receipt) } };
+    return { ...result, recovery:{ outcome, writeUnlocked:true, taskId:task.id, bookId:this.bookId, recordId:result.recordId ?? null, nodeID:pending.nodeID, priorRecordIds:prior.map(record=>record.shitiID), priorRecordsUnchanged:true, targetRecordUnique:outcome === 'saved', fullContentCompared:outcome === 'saved', liveNoSaveRequests:outcome === 'not_saved', evidencePath:this._pendingWrite.evidencePath, receiptKnown:Boolean(pending.receipt || this._pendingWrite.receipt || retainedReceipt) } };
   }
 
   async close() {
+    if (this.#pageObservation) this.#pageObservation.continuous = false;
     if (this.ownsContext) await this.context?.close();
     this.page = null;
     this.context = null;

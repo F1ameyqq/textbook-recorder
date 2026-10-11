@@ -1,3 +1,6 @@
+import { requireRecorderDocumentReady, assertRecorderDocumentSnapshot, recorderDocumentSnapshot } from './browser-document-state.mjs';
+import { validateBrowserFocusMode, validateBrowserWindowMode } from './browser-focus.mjs';
+import { randomUUID } from 'node:crypto';
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const SAMPLE_COUNT = 3;
 const SAMPLE_INTERVAL_MS = 80;
@@ -12,7 +15,9 @@ const sameRect = (left, right) => ['x', 'y', 'width', 'height']
  * application state, dispatching events, or bypassing an obstructing element.
  * The caller's guard owns page/book/editor identity and post-click verification.
  */
-export async function checkedPointerClick(page, locator, { guard, timeout = 20000 } = {}) {
+export async function checkedPointerClick(page, locator, { guard, timeout = 20000, focusMode = 'foreground', windowMode = 'normal', preserveEditorFocus = false, beforeInput } = {}) {
+  validateBrowserFocusMode(focusMode); validateBrowserWindowMode(windowMode);
+  if (focusMode === 'foreground' && windowMode === 'minimized') throw new Error('minimized 只支持 background 模式');
   if (!page || typeof page.isClosed !== 'function' || !locator || typeof locator.page !== 'function'
       || locator.page() !== page) throw new Error('Checked pointer click requires a locator on the supplied page');
   if (typeof guard !== 'function') throw new Error('Checked pointer click requires a scope guard');
@@ -29,6 +34,19 @@ export async function checkedPointerClick(page, locator, { guard, timeout = 2000
     if (await locator.count() !== 1) throw new Error('Checked pointer target must be unique');
     if (!await locator.isVisible()) throw new Error('Checked pointer target is not visible');
     if (!await locator.isEnabled({ timeout: remaining() })) throw new Error('Checked pointer target is disabled');
+  };
+  let documentBinding;
+  const background = focusMode === 'background';
+  const minimized = focusMode === 'background' && windowMode === 'minimized';
+  if (typeof preserveEditorFocus !== 'boolean' || preserveEditorFocus && !minimized) throw new Error('Preserving editor focus is restricted to minimized background Save activation');
+  if(beforeInput!==undefined&&(!preserveEditorFocus||typeof beforeInput!=='function'))throw new Error('Pre-Save assertion is restricted to preserved editor focus');
+  const checkBackgroundWindow = async () => {
+    const next = await requireRecorderDocumentReady(page, { focusMode, windowMode, guard });
+    if (documentBinding) {
+      assertRecorderDocumentSnapshot(next, documentBinding);
+      if (String(next.windowId) !== String(documentBinding.windowId)) throw new Error('Recorder window identity changed during input checks');
+    }
+    documentBinding = next;
   };
   const sample = async () => {
     const state = await locator.evaluate(element => {
@@ -53,13 +71,15 @@ export async function checkedPointerClick(page, locator, { guard, timeout = 2000
     if (!state.connected || state.rect.width <= 0 || state.rect.height <= 0
         || !Object.values(state.rect).every(Number.isFinite)
         || !Object.values(state.position).every(Number.isFinite)) throw new Error('Checked pointer target has no connected visible rectangle');
-    if (!state.visibleDocument) throw new Error('Checked pointer document is hidden');
+    if (background) assertRecorderDocumentSnapshot(await page.evaluate(recorderDocumentSnapshot), documentBinding);
+    if (!minimized && !state.visibleDocument) throw new Error('Checked pointer document is hidden');
     if (!state.inViewport) throw new Error('Checked pointer target center is outside the viewport');
     if (!state.hitTarget) throw new Error('Checked pointer target is covered by another element');
     return state;
   };
 
   await guard();
+  if (background) await checkBackgroundWindow();
   await ready();
   // scrollIntoViewIfNeeded also waits for rAF stability. Ordinary instant
   // scrolling changes only the viewport and is checked before sending input.
@@ -95,9 +115,68 @@ export async function checkedPointerClick(page, locator, { guard, timeout = 2000
     if (remaining() <= SAMPLE_INTERVAL_MS) throw new Error('Checked pointer target did not settle before timeout');
     await pause(SAMPLE_INTERVAL_MS);
   }
-  // Force skips the broken rAF check. All actionability checks above still
-  // apply; no second scroll may invalidate the final hit-test coordinates.
-  await locator.click({ force: true, scroll: 'none', position: final.position, timeout: remaining() });
+  // Page.mouse sends native input at the checked viewport coordinates, with no
+  // locator's additional scrolling/actionability cycle after these checks.
+  if (background) {
+    await checkBackgroundWindow();
+    const checked = await sample();
+    if (!sameRect(final.rect, checked.rect)) throw new Error('Checked pointer target moved before input');
+  }
+  const clickKey = '__recorderPointer_' + randomUUID().replaceAll('-', '');
+  await locator.evaluate((element,{key,preserveEditorFocus})=>{
+    const events=[];
+    const listener=event=>events.push({trusted:event.isTrusted,inside:event.target===element||element.contains(event.target),x:event.clientX,y:event.clientY});
+    const activeEditor=document.activeElement,blurEvents=[];
+    if(preserveEditorFocus&&(!element.matches('button.top-btn')||element.textContent.trim()!=='保存'
+      ||document.querySelectorAll('#contentedit .w-e-text').length!==1||activeEditor!==document.querySelector('#contentedit .w-e-text')))throw new Error('No-focus activation requires the real Save button and active owned content editor');
+    const blurListener=event=>{if(event.target===document.querySelector('#contentedit .w-e-text')||event.target===document.querySelector('#answeredit .w-e-text'))blurEvents.push({editor:event.target.closest('#contentedit')?'contentedit':'answeredit',trusted:event.isTrusted});};
+    window[key]={events,listener,blurEvents,blurListener,activeEditor};document.addEventListener('click',listener,true);
+    if(preserveEditorFocus)document.addEventListener('blur',blurListener,true);
+  },{key:clickKey,preserveEditorFocus});
+  let events;
+  let editorFocus;
+  try {
+    remaining();
+    if(beforeInput){await beforeInput();remaining();}
+    if (minimized) {
+      await locator.evaluate((element,{point,binding,preserveEditorFocus,key})=>{
+        if(location.href!==binding.url||performance.timeOrigin!==binding.timeOrigin)throw new Error('Background activation document changed');
+        const rect=element.getBoundingClientRect(),hit=document.elementFromPoint(point.x,point.y),style=getComputedStyle(element);
+        if(!(element instanceof HTMLElement)||!element.isConnected||rect.width<=0||rect.height<=0
+            ||style.display==='none'||style.visibility==='hidden'||!(hit===element||hit&&element.contains(hit)))throw new Error('Background activation target is hidden or covered');
+        // Standard browser focus/activation: no fabricated events, framework
+        // state mutation or save endpoint. Focus also performs ordinary blur.
+        if(preserveEditorFocus){
+          const slot=window[key];
+          if(!slot||document.activeElement!==slot.activeEditor||slot.activeEditor!==document.querySelector('#contentedit .w-e-text')
+            ||!element.matches('button.top-btn')||element.textContent.trim()!=='保存')throw new Error('Owned editor focus changed before Save activation');
+        }else element.focus({preventScroll:true});
+        // Activate the actual hit-tested child, so child label/icon handlers
+        // receive the same target as a pointer at the checked coordinates.
+        let activationTarget=hit;
+        while(activationTarget&&!(activationTarget instanceof HTMLElement))activationTarget=activationTarget.parentElement;
+        if(!activationTarget||!(activationTarget===element||element.contains(activationTarget)))throw new Error('Background activation hit target changed');
+        HTMLElement.prototype.click.call(activationTarget);
+        if(preserveEditorFocus&&document.activeElement!==window[key].activeEditor)throw new Error('Save activation changed owned editor focus');
+      },{point:final.point,binding:documentBinding,preserveEditorFocus,key:clickKey});
+    } else await page.mouse.click(final.point.x,final.point.y);
+  } finally {
+    const observation=await page.evaluate(({key,preserveEditorFocus})=>{const slot=window[key];if(!slot)throw new Error('Pointer event observation lost its document');document.removeEventListener('click',slot.listener,true);if(preserveEditorFocus)document.removeEventListener('blur',slot.blurListener,true);delete window[key];return {events:slot.events,editorFocus:preserveEditorFocus?{preserved:document.activeElement===slot.activeEditor,blurEvents:slot.blurEvents}:null};},{key:clickKey,preserveEditorFocus});
+    events=observation.events;editorFocus=observation.editorFocus;
+  }
+  if(events.length!==1||(!minimized&&!events[0].trusted)||!events[0].inside) {
+    const error=new Error('Native pointer click did not reach the checked target: '+JSON.stringify(events));
+    error.nativePointer={point:final.point,rect:final.rect,events,documentCheck:documentBinding};throw error;
+  }
+  if(preserveEditorFocus&&(!editorFocus?.preserved||editorFocus.blurEvents.length)){
+    const error=new Error('Save activation blurred an owned editor; retain the write lock');
+    error.nativePointer={point:final.point,rect:final.rect,events,editorFocus,documentCheck:documentBinding};throw error;
+  }
   await guard();
-  return { clicked: true, point: final.point, rect: final.rect, samples: SAMPLE_COUNT, totalSamples, tolerancePx: RECT_TOLERANCE_PX };
+  if (background) await checkBackgroundWindow();
+  return { clicked: true, point: final.point, rect: final.rect, samples: SAMPLE_COUNT, totalSamples, tolerancePx: RECT_TOLERANCE_PX,
+    nativeClick:events[0],
+    activationMethod:minimized?(preserveEditorFocus?'HTMLElement.click/preserve-editor-focus':'HTMLElement.focus/click'):'page.mouse.click',
+    ...(preserveEditorFocus?{editorFocus}:{}),
+    ...(background ? {documentCheck:{...documentBinding,checkedAt:new Date().toISOString()}} : {}) };
 }

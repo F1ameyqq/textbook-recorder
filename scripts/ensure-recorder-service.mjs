@@ -22,11 +22,13 @@ export async function ensureRecorderService(root=defaultRoot,{configPath='config
   const config=await loadRecorderConfig(root,configPath),expectedSession=await writableWorkspacePath(root,sessionPath),directory=path.join(root,'data/persistent-executor');
   const health=async(control)=>{
     if(control.bookId!==config.bookId||control.port!==config.port||control.sessionPath!==expectedSession)throw new Error('现有服务与书籍、端口或原会话不符，不另启写入器');
+    if(control.focusMode!==config.focusMode||control.windowMode!==config.windowMode)throw new Error('现有服务与请求的 focusMode/windowMode 不符，不另启写入器；先安全关闭旧服务');
     const response=await fetchImpl('http://127.0.0.1:'+control.port+'/health',{headers:{'x-recorder-key':control.key,connection:'close'},signal:AbortSignal.timeout(3000)});
     if(!response.ok)throw new Error('已有服务无法通过本地身份检查，不另启写入器');
     const value=await response.json();
     if(value.bookId!==config.bookId||value.sessionPath!==expectedSession)throw new Error('本地服务健康检查身份不符，不另启写入器');
-    return {bookId:config.bookId,pid:control.pid,port:control.port,sessionPath:expectedSession,reused:true,connection:value.connection,pending:value.pending?{id:value.pending.id,action:value.pending.action}:null,writeBlocked:value.writeBlocked};
+    if(value.focusMode!==config.focusMode||value.windowMode!==config.windowMode)throw new Error('本地服务健康检查的 focusMode/windowMode 不符，不另启写入器；先安全关闭旧服务');
+    return {bookId:config.bookId,pid:control.pid,port:control.port,sessionPath:expectedSession,focusMode:value.focusMode,windowMode:value.windowMode,requestedFocusMode:config.focusMode,requestedWindowMode:config.windowMode,reused:true,connection:value.connection,pending:value.pending?{id:value.pending.id,action:value.pending.action}:null,writeBlocked:value.writeBlocked};
   };
   const previous=await controller(root);
   if(previous&&alive(previous.pid))return health(previous);

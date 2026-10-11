@@ -1,6 +1,7 @@
 import { accessSync, constants, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { resolveAssetPath } from './core.mjs';
+import { assertNativeEmphasis } from './native-emphasis.mjs';
 
 const isObject = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const isId = value => typeof value === 'string' && /^[A-Za-z0-9_-]+$/.test(value);
@@ -165,7 +166,14 @@ function prepareRecord(record) {
   copied.blocks = record.blocks === undefined
     ? (copied.cleanText.trim() ? [{ type: 'text', text: copied.cleanText }] : [])
     : record.blocks.map(block => {
-      if (block.type === 'text') return { ...structuredClone(block), text: normalizeOcrText(block.text) };
+      if (block.type === 'text') {
+        const text=normalizeOcrText(block.text);
+        if(block.emphasis?.schemaVersion===1) {
+          assertNativeEmphasis(block);
+          if(text!==block.text)throw new Error('带格式范围的正文不能清洗改字或偏移，须基于最终文字重新标注');
+        }
+        return { ...structuredClone(block), text };
+      }
       if (block.type === 'image') return { ...structuredClone(block), align: 'center' };
       return structuredClone(block);
     });

@@ -22,11 +22,11 @@ async function fixture(t){
     records.set(task.target.record,{status:'found',bookId:BOOK,target:task.target,source:task.source,count:records.size+1,recordId,stem:editor('stem'),answer:editor('answer')});
     return {bookId:BOOK,seqIndex:task.target.record,shitiID:recordId,mainPicNum:1,answerPicNum:9,request:{bookId:BOOK,seqIndex:task.target.record,mainPicNum:1,answerPicNum:9},response:{status:200,body:{errno:0,errmsg:'success',data:{seqIndex:task.target.record,shitiID:recordId,haveAnswer:true}}}};
   }};
-  const page={url:()=>recorderBookUrl(BOOK),bringToFront:async()=>{}},bridge=await installPersistentBridge({page,config:{root,bookId:BOOK},adapterFactory:()=>adapter});
+  const page={url:()=>recorderBookUrl(BOOK),bringToFront:async()=>{},evaluate:async()=>true},bridge=await installPersistentBridge({page,config:{root,bookId:BOOK,focusMode:'foreground',windowMode:'normal'},adapterFactory:()=>adapter});
   const args={manifest:'batch.json',state:'run.json',limit:1};
   return {root,args,bridge,adapter,starts,get appends(){return appends;}};
 }
-async function replaceBridge(f){const page={url:()=>recorderBookUrl(BOOK),bringToFront:async()=>{}};f.bridge=await installPersistentBridge({page,config:{root:f.root,bookId:BOOK},adapterFactory:()=>f.adapter});}
+async function replaceBridge(f){const page={url:()=>recorderBookUrl(BOOK),bringToFront:async()=>{},evaluate:async()=>true};f.bridge=await installPersistentBridge({page,config:{root:f.root,bookId:BOOK,focusMode:'foreground',windowMode:'normal'},adapterFactory:()=>f.adapter});}
 async function sessionFor(f,{pauseOnStart=false,oldProtocol=false,mutateStart=value=>value,mutateStatus=value=>value,loseStart=false,losePauseResponse=false,onPause=async()=>{}}={}){
   const callbacks=[],connection={servicePid:60001,authConfigured:true,onClosed:callback=>callbacks.push(callback),close:async()=>callbacks.forEach(callback=>callback()),client:{listTools:async()=>({tools:[{name:'browser_tabs',inputSchema:{properties:{action:{enum:['list','select']}}}},{name:'browser_run_code_unsafe',inputSchema:{properties:{code:{type:'string'}}}}]}),callTool:async({name,arguments:input})=>{
     if(name==='browser_tabs')return {structuredContent:{tabs:[{index:0,url:recorderBookUrl(BOOK)}]}};
@@ -37,7 +37,7 @@ async function sessionFor(f,{pauseOnStart=false,oldProtocol=false,mutateStart=va
     else value=f.bridge[action](payload);
     return {structuredContent:value};
   }}};
-  const session=new PersistentRecorderSession({root:f.root,bookId:BOOK,connect:async()=>connection,alive:()=>true,resolveAuth:async()=>({authConfigured:true})});await session.initialize();return session;
+  const session=new PersistentRecorderSession({root:f.root,bookId:BOOK,focusMode:'foreground',windowMode:'normal',connect:async()=>connection,alive:()=>true,resolveAuth:async()=>({authConfigured:true})});await session.initialize();return session;
 }
 
 test('continuation guards reject unknown fields, invalid identities, and non-execute commands',()=>{

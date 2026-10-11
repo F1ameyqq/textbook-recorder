@@ -1,7 +1,12 @@
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import path from 'node:path';
 import { resolveAssetPath } from './core.mjs';
+import { ANALYSIS_SEPARATOR, isAnalysisSeparator, assertAnalysisSeparator, renderAnalysisSeparator, compareAnalysisSeparatorImage } from './analysis-separator.mjs';
+import { assertNativeEmphasis, renderNativeEmphasis, nativeEmphasisSignature } from './native-emphasis.mjs';
+import { validBeforePlusProof } from './pre-append-recovery.mjs';
+import { validHistoricalNetworkRecoveryProof } from './historical-network-recovery.mjs';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const positive = value => Number.isSafeInteger(value) && value > 0;
@@ -15,6 +20,9 @@ export const ANSWER_PART_SPACE_COUNT = 8;
 const answerPartSeparator = '\u00a0'.repeat(ANSWER_PART_SPACE_COUNT);
 const spacedText = value => String(value).replace(/\r\n?/gu, '\n').replace(/\u00a0/gu, ' ')
   .replace(/ *\n */gu, '\n').replace(/\n{2,}/gu, '\n').trim();
+// Explicit strict spacing is authored content, including indentation and spaces
+// beside line breaks. Normalize only NBSP's HTML representation and line endings.
+const strictSpacedText = value => String(value).replace(/\r\n?/gu, '\n').replace(/\u00a0/gu, ' ');
 const validAnswerParts = value => Array.isArray(value) && value.length >= 2
   && value.every(part => nonempty(part) && part === part.trim() && !/[\r\n\t]/u.test(part));
 const doneStatuses = new Set(['completed', 'skipped_existing']);
@@ -40,7 +48,7 @@ function asset(filename, baseDir) {
 }
 
 function blockText(block) {
-  if (block.type === 'image') return '';
+  if (block.type === 'image' || isAnalysisSeparator(block)) return '';
   if (block.parts !== undefined) return block.parts.join(answerPartSeparator);
   return block.runs ? block.runs.map(run => run.text).join('') : block.text;
 }
@@ -81,20 +89,37 @@ function inspect(manifest, baseDir, checkFiles) {
     for (const side of ['stem', 'answer']) {
       const blocks = task[side]?.blocks;
       if (!Array.isArray(blocks) || !blocks.length) { errors.push(`${prefix}.${side}.blocks 不能为空`); continue; }
+      const separators = blocks.map((block, index) => isAnalysisSeparator(block) ? index : -1).filter(index => index >= 0);
+      if (separators.length) {
+        if (side !== 'answer') errors.push(`${prefix}.${side}: analysis-separator 仅允许用于答案`);
+        if (separators.length > 1) errors.push(`${prefix}.${side}: 最多允许一个解析分隔线`);
+        for (const index of separators) {
+          const hasContent = rows => rows.some(block => object(block) && !isAnalysisSeparator(block)
+            && (block.type === 'image' && nonempty(block.path) || nonempty(block.text)
+              || Array.isArray(block.parts) && block.parts.some(nonempty)
+              || Array.isArray(block.runs) && block.runs.some(run => nonempty(run?.text))));
+          if (!hasContent(blocks.slice(0, index)) || !hasContent(blocks.slice(index + 1))) errors.push(`${prefix}.${side}: 解析分隔线前后的答案和解析必须均非空`);
+        }
+      }
       for (const [blockIndex, block] of blocks.entries()) {
         const at = `${prefix}.${side}.blocks[${blockIndex}]`;
         if (!object(block)) { errors.push(`${at} 必须是对象`); continue; }
+        try { assertNativeEmphasis(block); } catch(error) { errors.push(`${at}: ${error.message}`); }
+        if (block.underline !== undefined || block.textEmphasis !== undefined || block.style !== undefined) errors.push(`${at}: 未知格式属性，必须使用明确的emphasis范围`);
+        if (block.strictSpacing !== undefined && (block.type !== 'text' || typeof block.strictSpacing !== 'boolean')) errors.push(`${at}.strictSpacing 仅允许 text 段落的布尔值`);
         if (block.parts !== undefined && (side !== 'answer' || block.type !== 'text')) errors.push(`${at}.parts 只允许用于答案的 text 段落`);
         if (block.type === 'text') {
-          if (block.strictSpacing !== undefined && (side !== 'answer' || typeof block.strictSpacing !== 'boolean')) errors.push(`${at}.strictSpacing 仅允许答案文本的布尔值`);
           if (block.parts !== undefined) {
             if (block.text !== undefined || block.runs !== undefined || !validAnswerParts(block.parts)) errors.push(`${at}.parts 必须是至少两个已确认的单行答案，不含首尾空白，不能同时含 text/runs`);
           } else if (block.runs !== undefined) {
-            if (block.text !== undefined || !Array.isArray(block.runs) || !block.runs.length || block.runs.some(run => !object(run) || !['text', 'sup', 'sub'].includes(run.type) || !nonempty(run.text))) errors.push(`${at}.runs 必须是 text/sup/sub 文本数组，不能同时含 text`);
+            if (block.text !== undefined || !Array.isArray(block.runs) || !block.runs.length || block.runs.some(run => !object(run) || Object.keys(run).some(key=>!['type','text'].includes(key)) || !['text', 'sup', 'sub'].includes(run.type) || !nonempty(run.text))) errors.push(`${at}.runs 必须是仅含type/text的 text/sup/sub 数组，不能同时含 text`);
           } else if (!nonempty(block.text)) errors.push(`${at}.text 不能为空`);
           if (block.align !== undefined && !['left', 'start'].includes(block.align)) errors.push(`${at}: 文字必须左对齐`);
         } else if (['sup', 'sub'].includes(block.type)) {
           if (!nonempty(block.text)) errors.push(`${at}.text 不能为空`);
+        } else if (isAnalysisSeparator(block)) {
+          try { assertAnalysisSeparator(block); }
+          catch (error) { errors.push(`${at}: ${error.message}`); }
         } else if (block.type === 'image') {
           if (block.align !== 'center') errors.push(`${at}: 图片必须明确 align:center`);
           try {
@@ -118,6 +143,10 @@ export function validateNewSystemManifest(manifest, baseDir = process.cwd()) { r
 
 /** Each block has its own paragraph so centered images cannot center subsequent options. */
 export function renderBlockHtml(block, baseDir = process.cwd()) {
+  assertNativeEmphasis(block);
+  if (block.strictSpacing !== undefined && (block.type !== 'text' || typeof block.strictSpacing !== 'boolean')) throw new Error('strictSpacing 仅允许 text 段落的布尔值');
+  if (block.underline !== undefined || block.textEmphasis !== undefined || block.style !== undefined) throw new Error('未知格式属性，必须使用emphasis范围');
+  if (isAnalysisSeparator(block)) return renderAnalysisSeparator(block);
   if (block?.type === 'image') {
     if (block.align !== 'center') throw new Error('图片必须明确居中');
     const image = asset(block.path, baseDir);
@@ -126,15 +155,18 @@ export function renderBlockHtml(block, baseDir = process.cwd()) {
     return `<p style="text-align:center;direction:ltr" dir="ltr" align="center"><img src="data:${image.mime};base64,${image.bytes.toString('base64')}" style="max-width:100%"></p>`;
   }
   const inline = run => {
-    if (!object(run) || !['text', 'sup', 'sub'].includes(run.type) || !nonempty(run.text)) throw new Error('只支持 text/sup/sub 文本');
-    const text = escape(run.text).replace(/\r\n?|\n/gu, '<br>');
+    if (!object(run) || !['text', 'sup', 'sub'].includes(run.type) || !nonempty(run.text)) throw new Error('只支持明确的 text/sup/sub 文本');
+    let text = escape(run.text).replace(/\r\n?|\n/gu, '<br>');
+    if (block.strictSpacing === true) text = text.replace(/ /gu, '&nbsp;');
     return run.type === 'text' ? text : `<${run.type}>${text}</${run.type}>`;
   };
   if (!object(block) || !['text', 'sup', 'sub'].includes(block.type)) throw new Error('复杂公式或未知内容类型不支持');
   if (block.parts !== undefined && (block.type !== 'text' || block.text !== undefined || block.runs !== undefined || !validAnswerParts(block.parts))) throw new Error('parts 必须是至少两个已确认的单行答案，不含首尾空白，不能同时含 text/runs');
   if (block.type === 'text' && block.runs !== undefined && (block.text !== undefined || !Array.isArray(block.runs) || !block.runs.length)) throw new Error('runs 无效或与 text 冲突');
+  if (block.runs?.some(run=>!object(run)||Object.keys(run).some(key=>!['type','text'].includes(key)))) throw new Error('runs只能包含明确的type/text，未知格式字段不可忽略');
   if (block.align !== undefined && !['left', 'start'].includes(block.align)) throw new Error('文字必须左对齐');
-  const contents = block.parts !== undefined ? block.parts.map(escape).join('&nbsp;'.repeat(ANSWER_PART_SPACE_COUNT)) : block.runs ? block.runs.map(inline).join('') : inline(block);
+  const partHtml = part => block.strictSpacing === true ? escape(part).replace(/ /gu, '&nbsp;') : escape(part);
+  const contents = block.emphasis !== undefined ? renderNativeEmphasis(block) : block.parts !== undefined ? block.parts.map(partHtml).join('&nbsp;'.repeat(ANSWER_PART_SPACE_COUNT)) : block.runs ? block.runs.map(inline).join('') : inline(block);
   return `<p style="text-align:left;direction:ltr" dir="ltr" align="left">${contents}</p>`;
 }
 
@@ -147,12 +179,13 @@ export function expectedEditor(editor, baseDir = process.cwd()) {
   // Rendering validates all block types and formatting, even if called directly.
   renderEditorHtml(editor, baseDir);
   return {
-    text: editor.blocks.filter(block => block.type !== 'image').map(blockText).join('\n'),
-    images: editor.blocks.filter(block => block.type === 'image').map(block => {
+    text: editor.blocks.filter(block => block.type !== 'image' && !isAnalysisSeparator(block)).map(blockText).join('\n'),
+    images: editor.blocks.filter(block => block.type === 'image' || isAnalysisSeparator(block)).map(block => {
+      if (isAnalysisSeparator(block)) return { type: 'analysis-separator', ...ANALYSIS_SEPARATOR };
       const image = asset(block.path, baseDir);
       return { sha256: image.sha256, path: block.path };
     }),
-    paragraphs: editor.blocks.map(block => ({ text: blockText(block), imageCount: block.type === 'image' ? 1 : 0, align: block.type === 'image' ? 'center' : 'left', direction: 'ltr', ...(block.parts !== undefined || block.strictSpacing === true ? { strictSpacing: true } : {}) })),
+    paragraphs: editor.blocks.map(block => ({ text: blockText(block), imageCount: block.type === 'image' || isAnalysisSeparator(block) ? 1 : 0, align: block.type === 'image' ? 'center' : 'left', direction: 'ltr', ...(isAnalysisSeparator(block) ? { type: 'analysis-separator' } : {}), ...(block.parts !== undefined || block.strictSpacing === true ? { strictSpacing: true } : {}) })),
   };
 }
 
@@ -162,7 +195,7 @@ const unescape = text => text.replace(/&#(?:x([0-9a-f]+)|(\d+));/giu, (entity, h
 })
   .replace(/&lt;/gu, '<').replace(/&gt;/gu, '>').replace(/&quot;/gu, '"').replace(/&#39;/gu, "'").replace(/&amp;/gu, '&');
 function expectedScripts(editor) {
-  return editor.blocks.flatMap(block => block.type === 'image' ? [] : block.runs ? block.runs.filter(run => run.type !== 'text').map(run => [run.type, sameText(run.text)]) : ['sup', 'sub'].includes(block.type) ? [[block.type, sameText(block.text)]] : []);
+  return editor.blocks.flatMap(block => block.type === 'image' || isAnalysisSeparator(block) ? [] : block.runs ? block.runs.filter(run => run.type !== 'text').map(run => [run.type, sameText(run.text)]) : ['sup', 'sub'].includes(block.type) ? [[block.type, sameText(block.text)]] : []);
 }
 
 /** Content, image identity/order/loading, paragraph isolation/alignment and target checks. */
@@ -184,11 +217,14 @@ export function compareNewSystemReadback(task, readback, { baseDir = process.cwd
     if (!Array.isArray(actual.images)) errors.push(`${side} 图片列表缺失`);
     else {
       if (actual.images.length !== expected.images.length) errors.push(`${side} 图片数量不一致`);
+      const htmlImages = typeof actual.html === 'string' ? [...actual.html.matchAll(/<img\b[^>]*>/giu)].map(match => match[0]) : [];
+      if (expected.images.some(image => image.type === 'analysis-separator') && htmlImages.length !== actual.images.length) errors.push(`${side} 解析分隔线HTML图片数量与回读列表不一致`);
       actual.images.forEach((image, index) => {
         if (!object(image)) { errors.push(`${side} 图片 ${index + 1} 回读数据无效`); return; }
         if (image.sha256 !== expected.images[index]?.sha256) errors.push(`${side} 图片 ${index + 1} 字节或顺序不一致`);
         if (image.complete !== true || !Number.isFinite(image.width) || image.width <= 0 || !Number.isFinite(image.height) || image.height <= 0) errors.push(`${side} 图片 ${index + 1} 未完整加载`);
-        if (image.align !== 'center') errors.push(`${side} 图片 ${index + 1} 未居中`);
+        if (expected.images[index]?.type === 'analysis-separator') errors.push(...compareAnalysisSeparatorImage(image, htmlImages[index]).map(error => `${side} 图片 ${index + 1}: ${error}`));
+        else if (image.align !== 'center') errors.push(`${side} 图片 ${index + 1} 未居中`);
       });
     }
     if (!Array.isArray(actual.paragraphs)) errors.push(`${side} 段落样式回读缺失`);
@@ -198,9 +234,22 @@ export function compareNewSystemReadback(task, readback, { baseDir = process.cwd
       paragraphs.forEach((item, index) => {
         if (!object(item)) { errors.push(`${side} 段落 ${index + 1} 回读数据无效`); return; }
         const want = expected.paragraphs[index];
+        const sourceBlock = task[side].blocks[index];
+        const marks = sourceBlock ? assertNativeEmphasis(sourceBlock) : [];
+        const native = item.nativeEmphasis;
+        if (marks.length || native?.marks?.length) {
+          try {
+            if (!native || !Array.isArray(native.marks) || nativeEmphasisSignature(blockText(sourceBlock),marks) !== nativeEmphasisSignature(native.text,native.marks)) errors.push(`${side} 段落 ${index+1} 加点/下划线范围与原文不一致`);
+          } catch(error) { errors.push(`${side} 段落 ${index+1} 加点/下划线回读无效: ${error.message}`); }
+        }
         if (!want || sameText(item?.text ?? '') !== sameText(want.text) || item.imageCount !== want.imageCount) errors.push(`${side} 段落 ${index + 1} 内容或图片位置不一致`);
-        if (want?.strictSpacing && spacedText(item?.text ?? '') !== spacedText(want.text)) errors.push(`${side} 段落 ${index + 1} 分段答案或8个半角空格间隔不一致`);
-        if (item?.imageCount > 0 && (item.imageCount !== 1 || sameText(item.text ?? '') || item.align !== 'center')) errors.push(`${side} 图片必须独占居中段落`);
+        const spacingText = sourceBlock?.strictSpacing === true ? strictSpacedText : spacedText;
+        if (want?.strictSpacing && spacingText(item?.text ?? '') !== spacingText(want.text)) errors.push(`${side} 段落 ${index + 1} ${sourceBlock?.strictSpacing === true ? '严格空格间隔或段首空格不一致' : '分段答案或8个半角空格间隔不一致'}`);
+        if (item?.imageCount > 0) {
+          if (want?.type === 'analysis-separator') {
+            if (item.imageCount !== 1 || sameText(item.text ?? '') || !['left', 'start'].includes(item.align) || item.direction !== 'ltr') errors.push(`${side} 解析分隔线必须独占左对齐段落`);
+          } else if (item.imageCount !== 1 || sameText(item.text ?? '') || item.align !== 'center') errors.push(`${side} 图片必须独占居中段落`);
+        }
         if (sameText(item?.text ?? '') && (!['left', 'start'].includes(item.align) || item.direction !== 'ltr')) errors.push(`${side} 文字段落必须左对齐且 direction:ltr`);
       });
     }
@@ -246,7 +295,8 @@ function stable(value) {
 }
 function hashManifest(manifest, baseDir) {
   const content = { ...manifest, tasks: manifest.tasks.map(({ review, ...task }) => task) };
-  const files = manifest.tasks.flatMap(task => ['stem', 'answer'].flatMap(side => task[side].blocks.filter(block => block.type === 'image').map(block => ({ path: block.path, sha256: asset(block.path, baseDir).sha256 }))));
+  const files = manifest.tasks.flatMap(task => ['stem', 'answer'].flatMap(side => task[side].blocks.filter(block => block.type === 'image' || isAnalysisSeparator(block)).map(block => isAnalysisSeparator(block)
+    ? { type: 'analysis-separator', ...ANALYSIS_SEPARATOR } : { path: block.path, sha256: asset(block.path, baseDir).sha256 })));
   return createHash('sha256').update(stable({ content, files })).digest('hex');
 }
 
@@ -296,11 +346,15 @@ export function reconcileNewSystemRun({ manifest, state, taskId, recovery, baseD
     }
     confirmation={kind:'new-system-server-readback-recovery',schemaVersion:1,manifestHash:state.manifestHash,taskId,bookId:manifest.bookId,target:structuredClone(task.target),recordId:recovery.recordId,nodeID:proof.nodeID,priorRecordIds:[...proof.priorRecordIds],priorRecordsUnchanged:true,targetRecordUnique:true,fullContentCompared:true,evidencePath:proof.evidencePath,confirmedAt:now,readbackSha256:createHash('sha256').update(stable(recovery)).digest('hex')};
   } else if (proof.outcome === 'not_saved') {
-    if (recovery.status !== 'missing' || recovery.count !== task.target.record - 1 || proof.liveNoSaveRequests !== true || proof.recordId !== null || entry.receipt || entry.recoveryConfirmation) throw new Error('未保存恢复必须有同连接无保存请求证明，且不能抹去已保存证据');
+    const beforePlus=validBeforePlusProof(proof.beforePlusFailure,{bookId:manifest.bookId,taskId,target:task.target,manifestHash:state.manifestHash});
+    const historical=proof.liveNoSaveRequests===false&&validHistoricalNetworkRecoveryProof(proof.historicalNetworkProof,{bookId:manifest.bookId,taskId,target:task.target,manifestHash:state.manifestHash})
+      &&proof.historicalNetworkProof.freshConfirmation.nodeID===proof.nodeID&&isDeepStrictEqual(proof.historicalNetworkProof.freshConfirmation.priorRecordIds,proof.priorRecordIds);
+    if (recovery.status !== 'missing' || recovery.count !== task.target.record - 1 || !(proof.liveNoSaveRequests === true||beforePlus||historical) || proof.recordId !== null || entry.receipt || entry.recoveryConfirmation) throw new Error('未保存恢复必须有同连接无保存请求、严格新增前失败或冻结历史加当前刷新证明，且不能抹去已保存证据');
   } else throw new Error('未知写入效果不能恢复');
   if (entry.recoveryHistory !== undefined && !Array.isArray(entry.recoveryHistory)) throw new Error('恢复历史数据无效');
   entry.recoveryHistory ??= [];
-  entry.recoveryHistory.push({outcome:proof.outcome,taskId,bookId:manifest.bookId,manifestHash:state.manifestHash,priorStatus:entry.status,priorAttempts:entry.attempts,recordId:recovery.recordId ?? null,evidencePath:proof.evidencePath,confirmedAt:now});
+  entry.recoveryHistory.push({outcome:proof.outcome,taskId,bookId:manifest.bookId,manifestHash:state.manifestHash,priorStatus:entry.status,priorAttempts:entry.attempts,recordId:recovery.recordId ?? null,evidencePath:proof.evidencePath,confirmedAt:now,...(proof.beforePlusFailure?{beforePlusFailure:structuredClone(proof.beforePlusFailure)}:{})});
+  if(proof.historicalNetworkProof)entry.recoveryHistory.at(-1).historicalNetworkProof=structuredClone(proof.historicalNetworkProof);
   if (confirmation) { entry.recoveryConfirmation=confirmation; entry.status='completed'; }
   else { entry.status='pending'; entry.attempts=0; delete entry.recoveryConfirmation; }
   entry.recoveryRequired=false;entry.lastError=null;state.updatedAt=now;

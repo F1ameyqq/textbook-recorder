@@ -14,7 +14,7 @@ async function fakeSession(t,{existing=false,failNew=false,duplicateNew=false,fa
   const root=await workspace(t),connections=[],live=new Set(),calls=[],closedPages=[];let connects=0,pageSequence=0;
   const connect=async()=>{
     connects++;const callbacks=[],pages=[];let current,job=null;
-    const makePage=url=>{const emptyEditor=()=>({textContent:'',innerText:'',nodes:[{tagName:'P'},{tagName:'BR'}],querySelectorAll(){return this.nodes;}}),page={id:++pageSequence,address:url,closed:false,editors:{'#contentedit .w-e-text':emptyEditor(),'#answeredit .w-e-text':emptyEditor()},url(){return this.address;},isClosed(){return this.closed;},context:()=>({pages:()=>pages}),evaluate:async fn=>{if(page.editorError)throw new Error('fake editor read failed');return vm.runInNewContext('('+fn.toString()+')()',{document:{querySelector:selector=>page.editors[selector]}});},close:async()=>{closedPages.push(page.id);page.closed=true;pages.splice(pages.indexOf(page),1);if(current===page)current=pages[0];}};page.__persistentRecorder={status:()=>({bookId:BOOK,job}),pause:()=>({bookId:BOOK,stopRequested:true}),start:command=>{job={id:command.id,action:command.action,terminal:true,running:false,result:{bookId:BOOK,uncertain:false}};return {bookId:BOOK,id:command.id,started:true};}};pages.push(page);return page;};
+    const makePage=url=>{const emptyEditor=()=>({textContent:'',innerText:'',nodes:[{tagName:'P'},{tagName:'BR'}],querySelectorAll(){return this.nodes;}}),page={id:++pageSequence,address:url,closed:false,editors:{'#contentedit .w-e-text':emptyEditor(),'#answeredit .w-e-text':emptyEditor()},url(){return this.address;},isClosed(){return this.closed;},context:()=>({pages:()=>pages}),evaluate:async fn=>{if(page.editorError)throw new Error('fake editor read failed');return vm.runInNewContext('('+fn.toString()+')()',{document:{querySelector:selector=>page.editors[selector]}});},close:async()=>{closedPages.push(page.id);page.closed=true;pages.splice(pages.indexOf(page),1);if(current===page)current=pages[0];}};page.__persistentRecorder={status:()=>({bookId:BOOK,focusMode:'foreground',windowMode:'normal',job}),pause:()=>({bookId:BOOK,stopRequested:true}),start:command=>{job={id:command.id,action:command.action,terminal:true,running:false,result:{bookId:BOOK,uncertain:false}};return {bookId:BOOK,id:command.id,started:true};}};pages.push(page);return page;};
     current=makePage(existing?recorderBookUrl(BOOK):'about:blank');const servicePid=60000+connects;live.add(servicePid);
     const connection={servicePid,authConfigured:true,pages,makePage,onClosed:fn=>callbacks.push(fn),disconnect:()=>{live.delete(servicePid);callbacks.forEach(fn=>fn());},close:async()=>{live.delete(servicePid);callbacks.forEach(fn=>fn());},client:{listTools:async()=>({tools:[{name:'browser_tabs',inputSchema:{properties:{action:{enum:['list','select','new','close']}}}},{name:'browser_run_code_unsafe',inputSchema:{properties:{code:{type:'string'}}}}]}),callTool:async({name,arguments:args})=>{
       calls.push({name,...args});let result;
@@ -27,7 +27,7 @@ async function fakeSession(t,{existing=false,failNew=false,duplicateNew=false,fa
       return {structuredContent:result};
     }}};connections.push(connection);return connection;
   };
-  const session=new PersistentRecorderSession({root,bookId:BOOK,connect,alive:pid=>live.has(pid),resolveAuth:async()=>({authConfigured:true}),maxAutomaticReconnects});await session.initialize();
+  const session=new PersistentRecorderSession({root,bookId:BOOK,focusMode:'foreground',windowMode:'normal',connect,alive:pid=>live.has(pid),resolveAuth:async()=>({authConfigured:true}),maxAutomaticReconnects});await session.initialize();
   return {root,session,connections,calls,closedPages,get connects(){return connects;}};
 }
 
@@ -97,7 +97,7 @@ test('ambiguous creation or a lost marker result retains pages and reports uncer
 
 test('a restarted service reports old ownership but never adopts it to close old pages',async t=>{
   const fake=await fakeSession(t);await fake.session.command({action:'probe'});
-  const restarted=new PersistentRecorderSession({root:fake.root,bookId:BOOK,connect:async()=>{throw new Error('Do not connect');}});await restarted.initialize();
+  const restarted=new PersistentRecorderSession({root:fake.root,bookId:BOOK,focusMode:'foreground',windowMode:'normal',connect:async()=>{throw new Error('Do not connect');}});await restarted.initialize();
   assert.equal(restarted.snapshot().tabCleanup.reason,'previous-service-page');const result=await restarted.close();assert.equal(result.tabCleanup.outcome,'retained');assert.deepEqual(fake.closedPages,[]);
   await fake.session.close();
 });

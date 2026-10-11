@@ -81,6 +81,59 @@ test('mixed subscript answer groups require exactly eight half-width spaces when
   assert.equal(validateNewSystemManifest(manifest,baseDir).valid,false);
 });
 
+test('explicit strict spacing on either editor renders indentation, gaps and choice blanks as NBSP', t => {
+  const { task, manifest, baseDir } = fixture(t);
+  const text = '   首段（        ）\nA. 甲        乙';
+  const expectedContents = '&nbsp;&nbsp;&nbsp;首段（' + '&nbsp;'.repeat(8) + '）<br>A.&nbsp;甲' + '&nbsp;'.repeat(8) + '乙';
+  for (const side of ['stem', 'answer']) {
+    task[side].blocks = [{ type: 'text', text, strictSpacing: true }];
+    assert.equal(validateNewSystemManifest(manifest, baseDir).valid, true);
+    assert.equal(renderEditorHtml(task[side], baseDir), `<p style="text-align:left;direction:ltr" dir="ltr" align="left">${expectedContents}</p>`);
+    assert.equal(expectedEditor(task[side], baseDir).text, text, 'authoring text retains its original code-point offsets');
+    task[side].blocks[0].strictSpacing = false;
+    assert.doesNotMatch(renderEditorHtml(task[side], baseDir), /&nbsp;/u, 'ordinary text retains existing whitespace semantics');
+    task[side].blocks[0].strictSpacing = true;
+  }
+});
+
+test('strict paragraph readback rejects collapsed, shortened or removed spaces without trimming indentation', t => {
+  const { task, baseDir } = fixture(t);
+  const text = '   段首（        ）\n   A. 甲        乙 ';
+  const changes = [
+    text => text.replace(/ {8}/gu, ' '),
+    text => text.replace(/ {8}/u, ' '.repeat(7)),
+    text => text.slice(1),
+    text => text.trimStart(),
+    text => text.replace('\n   ', '\n'),
+    text => text.trimEnd(),
+  ];
+  for (const side of ['stem', 'answer']) {
+    task[side].blocks = [{ type: 'text', text, strictSpacing: true }];
+    const independentParagraph = { text: text.replace(/ /gu, '\u00a0'), imageCount: 0, align: 'left', direction: 'ltr' };
+    const good = readback(task, baseDir);
+    good[side].paragraphs = [independentParagraph];
+    assert.equal(compareNewSystemReadback(task, good, { baseDir }).ok, true);
+    for (const mutate of changes) {
+      const actual = readback(task, baseDir);
+      // Full-editor text intentionally stays unchanged: paragraph evidence must
+      // independently detect the missing spaces, including at either edge.
+      actual[side].paragraphs = [{ ...independentParagraph, text: mutate(text) }];
+      const comparison = compareNewSystemReadback(task, actual, { baseDir });
+      assert.equal(comparison.ok, false, `${side}: ${JSON.stringify(actual[side].paragraphs[0].text)}`);
+      assert.match(comparison.errors.join('; '), /严格空格间隔或段首空格/u);
+    }
+  }
+});
+
+test('strictSpacing rejects nonboolean values and nontext blocks rather than silently ignoring them', t => {
+  const { task, manifest, baseDir } = fixture(t);
+  for (const block of [{ type: 'text', text: '正文', strictSpacing: 'true' }, { type: 'sup', text: '2', strictSpacing: true }]) {
+    task.stem.blocks = [block];
+    assert.equal(validateNewSystemManifest(manifest, baseDir).valid, false);
+    assert.throws(() => renderEditorHtml(task.stem, baseDir), /strictSpacing/u);
+  }
+});
+
 test('HTTP 200 with platform errno or missing answer is rejected', t => {
   const { task } = fixture(t);
   for (const edit of [ack => { ack.response.body.errno = 300006; }, ack => { ack.response.body.data.haveAnswer = false; }, ack => { ack.response.body.errmsg = 'ok'; }]) {

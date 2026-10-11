@@ -2,5 +2,7 @@
   "schemaVersion": 1,
   "bookId": 100001,
   "port": 8789,
-  "origin": "https://easylearn.baidu.com"
+  "origin": "https://easylearn.baidu.com",
+  "focusMode": "background",
+  "windowMode": "normal"
 }

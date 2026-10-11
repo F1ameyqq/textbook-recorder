@@ -3,6 +3,8 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { validatePairedBatch } from './paired-batch.mjs';
 import { inspectReviewedBatch } from './review-preflight.mjs';
+import { assertNativeEmphasis } from './native-emphasis.mjs';
+import { validateRecordRepairSnapshot } from './reviewed-record-repair-snapshot.mjs';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonempty = value => typeof value === 'string' && value.trim().length > 0;
@@ -30,6 +32,36 @@ function referencedJson(baseDir, reference, label) {
   const bytes = localBytes(baseDir, reference.path);
   if (hash(bytes) !== reference.sha256) throw new Error(`${label} SHA256 不一致`);
   return JSON.parse(bytes.toString('utf8').replace(/^\uFEFF/u, ''));
+}
+
+function correctionBaseline(mapping, baseDir) {
+  if (mapping.correction === undefined) return null;
+  const correction = mapping.correction;
+  if (!object(correction) || correction.schemaVersion !== 1 || !nonempty(correction.beforeManifest)
+      || !hashString(correction.beforeSha256)
+      || Object.keys(correction).some(key => !['schemaVersion', 'beforeManifest', 'beforeSha256', 'beforeSnapshot'].includes(key))) {
+    throw new Error('correction 必须是 schemaVersion:1 的 beforeManifest/beforeSha256 绑定');
+  }
+  const before = referencedJson(baseDir, { path: correction.beforeManifest, sha256: correction.beforeSha256 }, 'correction.beforeManifest');
+  if (!object(before) || before.schemaVersion !== 1 || before.kind !== 'new-system-batch'
+      || before.bookId !== mapping.bookId || before.source !== mapping.source || !Array.isArray(before.tasks)
+      || before.tasks.length !== mapping.placements.length) throw new Error('correction 基线须为同书同来源、完整对应任务的既有题单');
+  const byId = new Map(), recordIds = new Set();
+  for (const task of before.tasks) {
+    if (!object(task) || !nonempty(task.id) || byId.has(task.id) || !object(task.target)
+        || !positive(task.target.expectedRecordId) || recordIds.has(task.target.expectedRecordId) || task.review?.status !== 'approved'
+        || !['sourceText', 'answerMatch', 'wholeQuestion', 'format'].every(key => task.review?.checks?.[key] === true)) {
+      throw new Error('correction 基线任务须唯一、已审校，且有明确的正整数 expectedRecordId');
+    }
+    byId.set(task.id, task);
+    recordIds.add(task.target.expectedRecordId);
+  }
+  if(correction.beforeSnapshot!==undefined){
+    if(before.tasks.length!==1)throw new Error('空答案/归零来源修复快照仅允许单题');
+    const snapshot=referencedJson(baseDir,correction.beforeSnapshot,'correction.beforeSnapshot');
+    validateRecordRepairSnapshot(snapshot,before.tasks[0],mapping.bookId);
+  }
+  return byId;
 }
 
 /** Read actual raster headers; reported index dimensions alone are not trusted. */
@@ -149,6 +181,7 @@ function convertBlocks(blocks, record, indexed, crops) {
   if (!Array.isArray(blocks) || !blocks.length) return [];
   return blocks.map(block => {
     if (!object(block)) throw new Error('内容块必须是对象');
+    if (block.emphasis?.schemaVersion===1) assertNativeEmphasis(block);
     if (block.type === 'image') return imageBlock(block, record, indexed, crops);
     // Unsupported formulas stay explicit and blocked; never replace them with
     // a guessed exponent, linear formula or whole-question screenshot.
@@ -174,12 +207,18 @@ export function prepareDraftBatch(paired, mapping, baseDir, provenance = {}) {
   if (!object(mapping) || mapping.schemaVersion !== 1 || mapping.kind !== 'new-system-draft-mapping'
       || mapping.bookId !== paired.bookId || !['fixture','production'].includes(mapping.source)
       || !Array.isArray(mapping.placements)) throw new Error('mapping 必须明确版本/kind/bookId/source/placements');
+  const beforeById = correctionBaseline(mapping, baseDir);
   const indexed = sourceIndex(mapping, baseDir), crops = cropMap(mapping, baseDir, indexed), placements = new Map();
   const ids = new Set(paired.tasks.map(task => task.id));
   for (const placement of mapping.placements) {
     if (!object(placement) || !ids.has(placement.questionId) || placements.has(placement.questionId)) throw new Error('placement 必须唯一引用已有 questionId');
     if (!object(placement.target) || !nonempty(placement.target.chapterLabel) || !nonempty(placement.target.sectionLabel) || !positive(placement.target.record)
-        || placement.target.expectedRecordId !== undefined) throw new Error('新草稿 placement.target 必须有 chapterLabel/sectionLabel/正整数 record，不接受既有 ID');
+        || (beforeById ? !positive(placement.target.expectedRecordId) : placement.target.expectedRecordId !== undefined)) {
+      throw new Error('新草稿 placement.target 必须有 chapterLabel/sectionLabel/正整数 record；既有 ID 仅接受已冻结 correction 基线中的正整数');
+    }
+    if (beforeById && (!beforeById.has(placement.questionId) || !same(beforeById.get(placement.questionId).target, placement.target))) {
+      throw new Error('correction placement 的 task ID/target 与冻结基线不一致');
+    }
     if (!requirementOkay(placement.answerRequirement) || !['provided','not-provided'].includes(placement.answerStatus)) throw new Error('placement 必须声明具体作答要求和 answerStatus；缺答备注不是题目依据');
     if (placement.replacementBlocks !== undefined && (!object(placement.replacementBlocks) || !agentChecked(placement.agentReview)
         || Object.keys(placement.replacementBlocks).some(side => !['stem','answer'].includes(side)
@@ -219,7 +258,10 @@ export function prepareDraftBatch(paired, mapping, baseDir, provenance = {}) {
       if (placement.replacementBlocks?.answer !== undefined) issues.push('unpaired_answer_replacement_forbidden');
     }
     const stemBlocks = convertBlocks(placement.replacementBlocks?.stem ?? entry.stem.blocks, entry.stem, indexed, crops);
-    for (const side of [stemBlocks, answerBlocks]) if (side.some(block => !['text','image','sup','sub'].includes(block.type))) issues.push('unsupported_native_format');
+    if (beforeById && !same(beforeById.get(entry.id)?.source, { pages: entry.stem.source.pages, answerPages })) {
+      throw new Error('correction task 的 source 与冻结基线不一致');
+    }
+    for (const side of [stemBlocks, answerBlocks]) if (side.some(block => !['text','image','sup','sub','analysis-separator'].includes(block.type))) issues.push('unsupported_native_format');
     return { id: entry.id, target: clone(placement.target), source: { pages: clone(entry.stem.source.pages), answerPages },
       stem: { blocks: stemBlocks }, answer: { blocks: answerBlocks }, answerRequirement: clone(placement.answerRequirement), answerStatus: placement.answerStatus,
       review: { status: 'pending', issues: [...new Set(issues)], checks: { sourceText: false, answerMatch: false, wholeQuestion: false, format: false } },
@@ -233,6 +275,7 @@ export function prepareDraftBatch(paired, mapping, baseDir, provenance = {}) {
     indexed.imageFor(item.page, item.imagePath);
   }
   const manifest = { schemaVersion: 1, kind: 'new-system-batch', bookId: mapping.bookId, source: mapping.source, tasks,
+    ...(beforeById ? { correction: clone(mapping.correction) } : {}),
     coverage: clone(mapping.coverage), preparation: { kind: 'local-paired-draft', ...clone(provenance), index: clone(mapping.index),
       ...(mapping.cropEvidence ? { cropEvidence: clone(mapping.cropEvidence) } : {}), unmatchedAnswerIds: clone(paired.unmatchedAnswerIds),
       unmatchedAnswers: clone(paired.preparation?.unmatchedAnswers ?? []),

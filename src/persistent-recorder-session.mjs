@@ -5,7 +5,9 @@ import {pathToFileURL} from 'node:url';
 import {connectMcp,parseTabs,selectBookTab,isBookTab,validateToolSet,parseBridgeResult,safeDiagnosticMessage} from '../scripts/run-new-system-extension.mjs';
 import {pidAlive} from './persistent-recorder-lock.mjs';
 import {resolveExtensionAuth} from './extension-auth.mjs';
-import {TASK_ACTIONS,PLATFORM_ORIGIN,validateRecorderConfig,validateRecorderCommand,workspacePath,existingWorkspacePath,existingWorkspaceDirectory,writableWorkspacePath,prepareRuntimeDirectory,recorderBookUrl} from './recorder-config.mjs';
+import {TASK_ACTIONS,PLATFORM_ORIGIN,validateRecorderConfig,validateRecorderCommand,workspacePath,existingWorkspacePath,existingWorkspaceDirectory,writableWorkspacePath,prepareRuntimeDirectory,recorderBookUrl,assertRecorderPage} from './recorder-config.mjs';
+import {validBeforePlusProof} from './pre-append-recovery.mjs';
+import {validHistoricalNetworkRecoveryProof} from './historical-network-recovery.mjs';
 
 const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 async function atomic(root,file,value){await writableWorkspacePath(root,file);await prepareRuntimeDirectory(root,path.dirname(file));const temporary=file+'.'+randomUUID()+'.tmp';await writableWorkspacePath(root,temporary);const handle=await fs.open(temporary,'wx');try{await handle.writeFile(JSON.stringify(value,null,2));await handle.sync();}finally{await handle.close();}await writableWorkspacePath(root,file);await fs.rename(temporary,file);}
@@ -17,11 +19,11 @@ const acceptedResume=(proof,generation,bookId,id)=>proof?.schemaVersion===1&&pro
 
 /** One persistent MCP client. Reconnection never resubmits a command. */
 export class PersistentRecorderSession{
-  constructor({root,bookId,statePath,connect=connectMcp,alive=pidAlive,resolveAuth=resolveExtensionAuth,maxAutomaticReconnects=1}){
-    validateRecorderConfig({bookId});this.root=path.resolve(root);this.bookId=bookId;
+  constructor({root,bookId,focusMode,windowMode,statePath,connect=connectMcp,alive=pidAlive,resolveAuth=resolveExtensionAuth,maxAutomaticReconnects=1}){
+    const config=validateRecorderConfig({bookId,focusMode,windowMode});this.focusMode=config.focusMode;this.windowMode=config.windowMode;this.root=path.resolve(root);this.bookId=bookId;
     if(!Number.isSafeInteger(maxAutomaticReconnects)||maxAutomaticReconnects<0||maxAutomaticReconnects>3)throw new Error('自动重连上限必须为 0–3');
     this.statePath=workspacePath(this.root,statePath??'data/persistent-executor/session.json');this.connectFactory=connect;this.alive=alive;this.resolveAuth=resolveAuth;
-    this.connection=null;this.dead=false;this.binding=false;this.busy=false;
+    this.connection=null;this.dead=false;this.binding=false;this.pageBindingId=null;this.busy=false;
     this.maxAutomaticReconnects=maxAutomaticReconnects;this.automaticReconnects=0;this.connectionAttempts=0;this.tabCreationAttempted=false;this.ownedTab=null;this.tabCleanup=null;
     this.continuationFence=null;this.pausePersistenceSupported=false;
     this.state={schemaVersion:1,bookId,pending:null,writeBlocked:false,blockedContext:null,last:null,seenIds:[],connectionCount:0,pauseControl:{schemaVersion:1,generation:0,paused:false}};
@@ -39,7 +41,7 @@ export class PersistentRecorderSession{
     }catch(error){if(error.code!=='ENOENT')throw error;}
   }
   async persist(){const snapshot=structuredClone(this.state),previous=this.persistPromise??Promise.resolve();this.persistPromise=previous.catch(()=>{}).then(()=>atomic(this.root,this.statePath,snapshot));await this.persistPromise;}
-  snapshot(){const blocked=this.state.blockedContext;return {bookId:this.bookId,sessionPath:this.statePath,connection:this.connection&&!this.dead?'connected':'disconnected',authConfigured:this.connection?.authConfigured??null,connectionCount:this.state.connectionCount,pauseControl:structuredClone(this.state.pauseControl),continuationFence:this.continuationFence?{...this.continuationFence,pauseGeneration:this.state.pauseControl.generation,paused:this.state.pauseControl.paused}:null,pending:this.state.pending,writeBlocked:this.state.writeBlocked,blockedContext:blocked,last:this.state.last,reconnect:{automaticAttempts:this.automaticReconnects,maximum:this.maxAutomaticReconnects,limited:this.automaticReconnects>=this.maxAutomaticReconnects&&(this.dead||!this.connection)},tabLifecycle:this.state.tabLifecycle??{created:[],lastCleanup:null},tabCleanup:this.tabCleanup,recovery:{required:this.state.writeBlocked,taskId:blocked?.taskId??null,pendingPath:blocked?.pendingPath??null,instruction:this.state.writeBlocked?'先对原 manifest/state/taskId 执行只读 reconcile；未知保存不能重新 execute':'没有待核对保存，可提交新的已审题单'}};}
+  snapshot(){const blocked=this.state.blockedContext;return {bookId:this.bookId,focusMode:this.focusMode,windowMode:this.windowMode,sessionPath:this.statePath,connection:this.connection&&!this.dead?'connected':'disconnected',authConfigured:this.connection?.authConfigured??null,connectionCount:this.state.connectionCount,pauseControl:structuredClone(this.state.pauseControl),continuationFence:this.continuationFence?{...this.continuationFence,pauseGeneration:this.state.pauseControl.generation,paused:this.state.pauseControl.paused}:null,pending:this.state.pending,writeBlocked:this.state.writeBlocked,blockedContext:blocked,last:this.state.last,reconnect:{automaticAttempts:this.automaticReconnects,maximum:this.maxAutomaticReconnects,limited:this.automaticReconnects>=this.maxAutomaticReconnects&&(this.dead||!this.connection)},tabLifecycle:this.state.tabLifecycle??{created:[],lastCleanup:null},tabCleanup:this.tabCleanup,recovery:{required:this.state.writeBlocked,taskId:blocked?.taskId??null,pendingPath:blocked?.pendingPath??null,instruction:this.state.writeBlocked?'先对原 manifest/state/taskId 执行只读 reconcile；未知保存不能重新 execute':'没有待核对保存，可提交新的已审题单'}};}
   async connect({explicit=false}={}){if(this.closing||this.closed)throw new Error('执行器正在关闭或已关闭');if(this.connectPromise)return this.connectPromise;if(explicit)this.automaticReconnects=0;this.connectPromise=this._connect({explicit}).finally(()=>{this.connectPromise=null;});return this.connectPromise;}
   async _connect({explicit=false}={}){
     if(this.connection&&!this.dead)return;
@@ -50,11 +52,43 @@ export class PersistentRecorderSession{
     if(this.state.authRequired){const auth=await this.resolveAuth();if(!auth.authConfigured)throw new Error('自动重连需要已配置的扩展凭据；不会重复请求浏览器授权');}
     const bridgePath=path.join(path.dirname(this.statePath),'persistent.bridge.cjs'),moduleUrl=pathToFileURL(path.join(this.root,'src/persistent-recorder-bridge.mjs')).href;
     await writableWorkspacePath(this.root,bridgePath);
-    await prepareRuntimeDirectory(this.root,path.dirname(bridgePath));await writableWorkspacePath(this.root,bridgePath);await fs.writeFile(bridgePath,`exports.default=async({page})=>{const {installPersistentBridge}=await import(${JSON.stringify(moduleUrl)});await installPersistentBridge({page,config:${JSON.stringify({root:this.root,bookId:this.bookId,origin:PLATFORM_ORIGIN,inputMode:'browser-command'})}});};`);
+    this.pageBindingId=randomUUID();
+    const config={root:this.root,bookId:this.bookId,origin:PLATFORM_ORIGIN,inputMode:'browser-command',focusMode:this.focusMode,windowMode:this.windowMode},configUrl=pathToFileURL(path.join(this.root,'src/recorder-config.mjs')).href;
+    // MCP run-code uses a VM without a dynamic-import callback. Keep imports in
+    // this CJS init-page closure; the VM invokes only this fixed Node-side loader.
+    const bootstrap=`exports.default=async({page})=>{
+      const {assertRecorderPage}=await import(${JSON.stringify(configUrl)}),context=page.context(),config=${JSON.stringify(config)},bindingId=${JSON.stringify(this.pageBindingId)};
+      const identity={schemaVersion:1,bookId:config.bookId,focusMode:config.focusMode,windowMode:config.windowMode,bindingId};
+      const matches=()=>context.pages().filter(candidate=>{try{if(candidate.isClosed())return false;assertRecorderPage(candidate.url(),config.bookId);return true;}catch{return false;}});
+      const assertTarget=target=>{if(target.context()!==context||target.isClosed())throw new Error('桥接安装目标不属于本连接');assertRecorderPage(target.url(),config.bookId);const pages=matches();if(pages.length!==1||pages[0]!==target)throw new Error('书籍录入页不能唯一确认，拒绝安装');if(target.__textbookRecorderSessionPage!==undefined&&target.__textbookRecorderSessionPage!==bindingId)throw new Error('书页已绑定其他连接，拒绝安装');};
+      let loader=context.__textbookRecorderBridgeBootstrap;
+      if(loader){if(Object.keys(identity).some(key=>loader[key]!==identity[key])||typeof loader.install!=='function')throw new Error('连接桥接加载器身份不匹配');}
+      else{loader=Object.freeze({...identity,install:async target=>{assertTarget(target);const {installPersistentBridge}=await import(${JSON.stringify(moduleUrl)});assertTarget(target);const bridge=await installPersistentBridge({page:target,config});assertTarget(target);const status=bridge.status();if(status.bookId!==config.bookId||status.focusMode!==config.focusMode||status.windowMode!==config.windowMode)throw new Error('安装桥接的书籍或浏览器模式不匹配');return bridge;}});Object.defineProperty(context,'__textbookRecorderBridgeBootstrap',{value:loader});}
+      if(config.focusMode==='foreground'){try{assertRecorderPage(page.url(),config.bookId);}catch{return;}await loader.install(page);}
+    };`;
+    await prepareRuntimeDirectory(this.root,path.dirname(bridgePath));await writableWorkspacePath(this.root,bridgePath);await fs.writeFile(bridgePath,bootstrap);
     const connected=await this.connectFactory(bridgePath);this.connection=connected;this.dead=false;this.binding=false;this.tabCreationAttempted=false;this.continuationFence=null;this.pausePersistenceSupported=false;this.state.authRequired=false;
     connected.onClosed?.(()=>{if(this.connection===connected){this.dead=true;this.binding=false;}});this.state.connectionCount++;await this.persist();validateToolSet((await this.connection.client.listTools()).tools);
   }
   async call(name,args){const result=await this.connection.client.callTool({name,arguments:args},undefined,{timeout:45000});if(result?.isError)throw new Error(safeDiagnosticMessage(result.content?.filter(row=>row.type==='text').map(row=>row.text).join(' ')??'MCP调用失败'));return result;}
+  backgroundPageCode({bound=true}={}){
+    return `const PLATFORM_ORIGIN=${JSON.stringify(PLATFORM_ORIGIN)}; const assertBookPage=${assertRecorderPage.toString()}; const bookPages=()=>page.context().pages().filter(candidate=>{try{if(candidate.isClosed())return false;assertBookPage(candidate.url(),${this.bookId});return true;}catch{return false;}}); const matches=bookPages(); if(matches.length!==1)throw new Error('书籍录入页不能唯一确认，拒绝采用活动页'); const target=matches[0]; ${bound?`const marked=page.context().pages().filter(candidate=>candidate.__textbookRecorderSessionPage===${JSON.stringify(this.pageBindingId)}); if(marked.length!==1||marked[0]!==target)throw new Error('绑定书页身份变化，拒绝采用活动页');`:''}`;
+  }
+  async invokeBridge(action,payload){
+    if(!['status','syncPause','pause','start','cleanupWindowHelper'].includes(action))throw new Error('桥接动作无效');
+    const argument=payload===undefined?'':JSON.stringify(payload),selection=this.focusMode==='background'?this.backgroundPageCode():'',target=this.focusMode==='background'?'target':'page';
+    return parseBridgeResult(await this.call('browser_run_code_unsafe',{code:`async (page) => { ${selection} const identity=${target}.__persistentRecorder?.status(); if(identity?.bookId!==${this.bookId}||identity.focusMode!==${JSON.stringify(this.focusMode)}||identity.windowMode!==${JSON.stringify(this.windowMode)})throw new Error('绑定书页桥接的书籍或 focusMode/windowMode 不匹配'); if (!${target}.__persistentRecorder) throw new Error('常驻桥接未安装'); return await ${target}.__persistentRecorder.${action}(${argument}); }`}));
+  }
+  bridgeLoaderCode(target){return `const loader=${target}.context().__textbookRecorderBridgeBootstrap; if(loader?.schemaVersion!==1||loader.bookId!==${this.bookId}||loader.focusMode!==${JSON.stringify(this.focusMode)}||loader.windowMode!==${JSON.stringify(this.windowMode)}||loader.bindingId!==${JSON.stringify(this.pageBindingId)}||typeof loader.install!=='function')throw new Error('连接桥接加载器身份不匹配'); await loader.install(${target});`;}
+  async bindBackgroundPage(ownerId){
+    const ownership=ownerId===undefined?'':`if(target.url()!==${JSON.stringify(recorderBookUrl(this.bookId))}||target.__textbookRecorderOwnedTab!==undefined)throw new Error('新建书页身份变化，保留页面'); Object.defineProperty(target,'__textbookRecorderOwnedTab',{value:${JSON.stringify(ownerId)}});`;
+    const result=parseBridgeResult(await this.call('browser_run_code_unsafe',{code:`async (page) => { ${this.backgroundPageCode({bound:false})} if(target.__textbookRecorderSessionPage!==undefined&&target.__textbookRecorderSessionPage!==${JSON.stringify(this.pageBindingId)})throw new Error('书页已绑定其他连接，拒绝采用'); if(!target.__persistentRecorder){${this.bridgeLoaderCode('target')}} const identity=target.__persistentRecorder.status(); if(identity.bookId!==${this.bookId}||identity.focusMode!==${JSON.stringify(this.focusMode)}||identity.windowMode!==${JSON.stringify(this.windowMode)})throw new Error('书页桥接的书籍或 focusMode/windowMode 不匹配'); const rechecked=bookPages();if(rechecked.length!==1||rechecked[0]!==target)throw new Error('书页在绑定期间变化，拒绝采用'); if(target.__textbookRecorderSessionPage===undefined)Object.defineProperty(target,'__textbookRecorderSessionPage',{value:${JSON.stringify(this.pageBindingId)}}); ${ownership} return {bookId:${this.bookId},focusMode:${JSON.stringify(this.focusMode)},windowMode:${JSON.stringify(this.windowMode)},bindingId:${JSON.stringify(this.pageBindingId)}${ownerId===undefined?'':`,ownerId:${JSON.stringify(ownerId)}`}}; }`}));
+    if(result.bookId!==this.bookId||result.focusMode!==this.focusMode||result.windowMode!==this.windowMode||result.bindingId!==this.pageBindingId||ownerId!==undefined&&result.ownerId!==ownerId)throw new Error('后台书页绑定未取得本书和模式证明');
+  }
+  async installForegroundBridge(){
+    const result=parseBridgeResult(await this.call('browser_run_code_unsafe',{code:`async (page) => { const PLATFORM_ORIGIN=${JSON.stringify(PLATFORM_ORIGIN)}; const assertBookPage=${assertRecorderPage.toString()}; assertBookPage(page.url(),${this.bookId}); if(!page.__persistentRecorder){${this.bridgeLoaderCode('page')}} return await page.__persistentRecorder.status(); }`}));
+    if(result.bookId!==this.bookId||result.focusMode!==this.focusMode||result.windowMode!==this.windowMode)throw new Error('前台书页桥接的书籍或 focusMode/windowMode 不匹配');
+  }
   async bind(){if(this.bindPromise)return this.bindPromise;this.bindPromise=this._bind().finally(()=>{this.bindPromise=null;});return this.bindPromise;}
   async _bind(){
     await this.connect();if(this.binding)return;let tabs=parseTabs(await this.call('browser_tabs',{action:'list'}));
@@ -65,19 +99,18 @@ export class PersistentRecorderSession{
       if(added.length!==1||!isBookTab(added[0].url,this.bookId)||!before.every(old=>tabs.some(tab=>tab.index===old.index&&tab.url===old.url))){this.recordTabCleanup({outcome:'retained',reason:'creation-identity-ambiguous'});await this.persist();throw new Error('新建书页身份不能唯一确认，保留页面；不会重复开页');}
       const selected=added[0],ownerId=randomUUID(),record={ownerId,bookId:this.bookId,servicePid:this.connection.servicePid,createdAt:new Date().toISOString(),indexAtCreation:selected.index,ownership:'unconfirmed'};
       this.state.tabLifecycle??={created:[],lastCleanup:null};this.state.tabLifecycle.created.push(record);await this.persist();
-      await this.call('browser_tabs',{action:'select',index:selected.index});
-      let marked;try{marked=parseBridgeResult(await this.call('browser_run_code_unsafe',{code:`async (page) => { if (page.url() !== ${JSON.stringify(recorderBookUrl(this.bookId))} || page.__textbookRecorderOwnedTab !== undefined) throw new Error('新建书页身份变化，保留页面'); Object.defineProperty(page, '__textbookRecorderOwnedTab', {value:${JSON.stringify(ownerId)}}); return {bookId:${this.bookId},ownerId:${JSON.stringify(ownerId)}}; }`}));if(marked.bookId!==this.bookId||marked.ownerId!==ownerId)throw new Error('新建书页标记未确认，保留页面');}
+      let marked;try{if(this.focusMode==='background')await this.bindBackgroundPage(ownerId);else{await this.call('browser_tabs',{action:'select',index:selected.index});marked=parseBridgeResult(await this.call('browser_run_code_unsafe',{code:`async (page) => { if (page.url() !== ${JSON.stringify(recorderBookUrl(this.bookId))} || page.__textbookRecorderOwnedTab !== undefined) throw new Error('新建书页身份变化，保留页面'); Object.defineProperty(page, '__textbookRecorderOwnedTab', {value:${JSON.stringify(ownerId)}}); return {bookId:${this.bookId},ownerId:${JSON.stringify(ownerId)}}; }`}));if(marked.bookId!==this.bookId||marked.ownerId!==ownerId)throw new Error('新建书页标记未确认，保留页面');}}
       catch(error){this.recordTabCleanup({outcome:'retained',reason:'ownership-unconfirmed',ownerId});await this.persist();throw error;}
       record.ownership='confirmed';this.ownedTab={ownerId,connection:this.connection};await this.persist();
     }
-    const selected=selectBookTab(tabs,this.bookId);await this.call('browser_tabs',{action:'select',index:selected.index});
+    const selected=selectBookTab(tabs,this.bookId);if(this.focusMode==='background')await this.bindBackgroundPage();else{await this.call('browser_tabs',{action:'select',index:selected.index});await this.installForegroundBridge();}
     await this.synchronizePauseControl();this.binding=true;
   }
   async mergePauseFence(value){const fence=readContinuationFence(value);if(!fence){this.continuationFence=null;return null;}const control=this.state.pauseControl,next={schemaVersion:1,generation:Math.max(control.generation,fence.pauseGeneration),paused:control.paused||fence.paused};this.continuationFence=fence;if(next.generation!==control.generation||next.paused!==control.paused){this.state.pauseControl=next;await this.persist();}return {...fence,pauseGeneration:next.generation,paused:next.paused};}
   async synchronizePauseControl(){
-    const remote=parseBridgeResult(await this.call('browser_run_code_unsafe',{code:"async (page) => { if (!page.__persistentRecorder) throw new Error('常驻桥接未安装'); return await page.__persistentRecorder.status(); }"}));if(remote.bookId!==this.bookId)throw new Error('暂停同步书籍不匹配');await this.mergePauseFence(remote.continuationFence);this.pausePersistenceSupported=remote.pausePersistenceSupported===true;
+    const remote=await this.invokeBridge('status');if(remote.bookId!==this.bookId||remote.focusMode!==this.focusMode||remote.windowMode!==this.windowMode)throw new Error('暂停同步书籍或 focusMode/windowMode 不匹配');await this.mergePauseFence(remote.continuationFence);this.pausePersistenceSupported=remote.pausePersistenceSupported===true;this.windowHelperCleanupSupported=remote.windowHelperCleanupSupported===true;
     if(!this.pausePersistenceSupported){if(this.state.pauseControl.paused||this.state.pauseControl.generation>0)throw new Error('浏览器桥接不支持持久暂停同步，保留暂停；请更新服务后再操作');return;}
-    const result=parseBridgeResult(await this.call('browser_run_code_unsafe',{code:`async (page) => { if (!page.__persistentRecorder) throw new Error('常驻桥接未安装'); return await page.__persistentRecorder.syncPause(${JSON.stringify(this.state.pauseControl)}); }`}));if(result.bookId!==this.bookId||!readContinuationFence(result.continuationFence))throw new Error('持久暂停同步未取得本书证明');await this.mergePauseFence(result.continuationFence);
+    const result=await this.invokeBridge('syncPause',this.state.pauseControl);if(result.bookId!==this.bookId||!readContinuationFence(result.continuationFence))throw new Error('持久暂停同步未取得本书证明');await this.mergePauseFence(result.continuationFence);
   }
   recordTabCleanup(result){this.tabCleanup={...result,at:new Date().toISOString()};this.state.tabLifecycle??={created:[],lastCleanup:null};this.state.tabLifecycle.lastCleanup=this.tabCleanup;const record=this.state.tabLifecycle.created.find(tab=>tab.ownerId===result.ownerId);if(record)record.cleanup=this.tabCleanup;}
   async cleanupOwnedTab(){
@@ -93,7 +126,7 @@ export class PersistentRecorderSession{
   async bridge(action,payload){await this.bind();if(action==='start'){
       const guard=payload.continuationGuard,control=this.state.pauseControl;
       if(guard&&(guard.connectionCount!==this.state.connectionCount||guard.pauseGeneration!==control.generation||control.paused)||payload.resumePauseGeneration!==undefined&&payload.resumePauseGeneration!==control.generation)return {bookId:this.bookId,id:payload.id,started:false,rejected:guard?'continuation-fence':'pause-fence',writePerformed:false,uncertain:false,continuationFence:{schemaVersion:1,previousTerminalId:this.continuationFence?.previousTerminalId??null,pauseGeneration:control.generation,paused:control.paused}};
-    }const argument=payload===undefined?'':JSON.stringify(payload),result=parseBridgeResult(await this.call('browser_run_code_unsafe',{code:`async (page) => { if (!page.__persistentRecorder) throw new Error('常驻桥接未安装'); return await page.__persistentRecorder.${action}(${argument}); }`}));if(result.bookId!==this.bookId)throw new Error('桥接书籍不匹配');return result;}
+    }const result=await this.invokeBridge(action,payload);if(result.bookId!==this.bookId)throw new Error('桥接书籍不匹配');return result;}
   context(args){return {manifest:workspacePath(this.root,args.manifest),state:workspacePath(this.root,args.state??args.manifest+'.persistent.run.json')};}
   async reviewedContext(args){
     const context=this.context(args),manifestPath=await existingWorkspacePath(this.root,context.manifest),bytes=await fs.readFile(manifestPath),manifest=JSON.parse(bytes);
@@ -130,9 +163,13 @@ export class PersistentRecorderSession{
           const result=remote.job.result;this.state.writeBlocked=result?.uncertain!==false;
           this.state.blockedContext=this.state.writeBlocked?{...this.state.blockedContext,taskId:result?.pendingWrite?.task?.id??this.state.blockedContext?.taskId??null,pendingPath:result?.pendingWrite?.evidencePath??this.state.blockedContext?.pendingPath??null}:null;
         }
-        if(pending.action==='reconcile'&&!remote.job.error&&this.state.writeBlocked){const result=remote.job.result,proof=result?.recovery,blocked=this.state.blockedContext;
-          const contentProof=proof?.outcome==='saved'?proof.priorRecordsUnchanged===true&&proof.targetRecordUnique===true&&proof.fullContentCompared===true&&Number.isSafeInteger(proof.recordId)&&proof.recordId>0:proof?.outcome==='not_saved'&&proof.liveNoSaveRequests===true&&proof.recordId===null;
-          if(result?.writePerformed===false&&result?.uncertain===false&&proof?.writeUnlocked===true&&contentProof&&result.manifestPath===blocked.manifest&&result.statePath===blocked.state&&result.taskId===blocked.taskId&&proof.taskId===blocked.taskId&&proof.bookId===this.bookId){this.state.writeBlocked=false;this.state.blockedContext=null;}
+        if(['reconcile','complete-record-repair'].includes(pending.action)&&!remote.job.error&&this.state.writeBlocked){const result=remote.job.result,proof=result?.recovery,blocked=this.state.blockedContext;
+          const historical=proof?.liveNoSaveRequests===false&&validHistoricalNetworkRecoveryProof(proof.historicalNetworkProof,{bookId:this.bookId,taskId:blocked.taskId,manifestSha256:blocked.manifestSha256})
+            &&proof.historicalNetworkProof.originalPendingPath===blocked.pendingPath&&proof.historicalNetworkProof.currentManifest===blocked.manifest&&proof.historicalNetworkProof.currentState===blocked.state
+            &&proof.historicalNetworkProof.freshConfirmation.nodeID===proof.nodeID&&JSON.stringify(proof.historicalNetworkProof.freshConfirmation.priorRecordIds)===JSON.stringify(proof.priorRecordIds);
+          const contentProof=proof?.outcome==='saved'?proof.priorRecordsUnchanged===true&&proof.targetRecordUnique===true&&proof.fullContentCompared===true&&Number.isSafeInteger(proof.recordId)&&proof.recordId>0:proof?.outcome==='not_saved'&&(proof.liveNoSaveRequests===true||validBeforePlusProof(proof.beforePlusFailure,{bookId:this.bookId,taskId:blocked.taskId,manifestSha256:blocked.manifestSha256})||historical)&&proof.priorRecordsUnchanged===true&&proof.recordId===null;
+          const writeScopeValid=pending.action==='complete-record-repair'?typeof result?.writePerformed==='boolean':result?.writePerformed===false;
+          if(writeScopeValid&&result?.uncertain===false&&proof?.writeUnlocked===true&&contentProof&&result.manifestPath===blocked.manifest&&result.statePath===blocked.state&&result.taskId===blocked.taskId&&proof.taskId===blocked.taskId&&proof.bookId===this.bookId){this.state.writeBlocked=false;this.state.blockedContext=null;}
         }
         this.state.pending=null;await this.persist();
       }else if(pending&&!remote.job&&!this.alive(pending.servicePid)&&this.connection.servicePid!==pending.servicePid){
@@ -151,7 +188,9 @@ export class PersistentRecorderSession{
       const context=!['probe','collect'].includes(action)?await this.reviewedContext(args):null;
       if(action==='collect'&&this.state.writeBlocked)throw new Error('保存结果待核对；保留写入锁，禁止切换来源页采集');
       if(action==='execute'&&this.state.writeBlocked)throw new Error('保存结果待核对；保留写入锁，禁止再次新增');
-      if(action==='reconcile'&&this.state.writeBlocked){await this.bindUnknownRecovery();const blocked=this.state.blockedContext,pendingPath=blocked.pendingPath?await writableWorkspacePath(this.root,args.pendingPath??blocked.pendingPath):null;if(context.manifest!==blocked.manifest||context.state!==blocked.state||context.manifestSha256!==blocked.manifestSha256||args.taskId!==blocked.taskId||blocked.pendingPath&&pendingPath!==blocked.pendingPath)throw new Error('只能核对原失败题单/进度/任务');if(blocked.pendingPath)args.pendingPath=pendingPath;}
+      if(action==='reconcile'&&args.historicalNetworkEvidencePath&&!this.state.writeBlocked)throw new Error('历史网络核对仅允许原已锁定的未知保存任务');
+      if(action==='complete-record-repair'&&!this.state.writeBlocked)throw new Error('补全仅允许原已绑定待核对任务');
+      if(['reconcile','complete-record-repair'].includes(action)&&this.state.writeBlocked){await this.bindUnknownRecovery();const blocked=this.state.blockedContext,pendingPath=blocked.pendingPath?await writableWorkspacePath(this.root,args.pendingPath??blocked.pendingPath):null;if(context.manifest!==blocked.manifest||context.state!==blocked.state||context.manifestSha256!==blocked.manifestSha256||args.taskId!==blocked.taskId||blocked.pendingPath&&pendingPath!==blocked.pendingPath)throw new Error('只能核对原失败题单/进度/任务');if(blocked.pendingPath)args.pendingPath=pendingPath;}
       const id=command.id??randomUUID();if(this.state.seenIds.includes(id))throw new Error('命令 ID 已使用，禁止重复派发');
       await this.bind();
       if(continuationGuard){const remote=await this.bridge('status'),fence=await this.mergePauseFence(remote.continuationFence);if(!fence||!this.pausePersistenceSupported)throw new Error('当前浏览器桥接缺少自动接续保护协议，未提交任务');if(fence.paused||fence.previousTerminalId!==continuationGuard.previousTerminalId||fence.pauseGeneration!==continuationGuard.pauseGeneration||continuationGuard.connectionCount!==this.state.connectionCount)throw new Error('自动接续的连接、暂停版本或原终止命令已变化，未提交任务');}
@@ -171,6 +210,6 @@ export class PersistentRecorderSession{
   }
   async close(){
     if(this.closed)return {bookId:this.bookId,closed:true,tabCleanup:this.tabCleanup};if(this.busy||this.connectPromise||this.bindPromise||this.closing)throw new Error('命令或连接正在执行，保留运行锁');this.closing=true;
-    try{if(this.statusPromise)await this.statusPromise;if(this.state.pending)throw new Error('任务未确认终止；先 pause 再等待 status');await this.cleanupOwnedTab();await this.persist();if(this.connection)await this.connection.close();this.connection=null;this.dead=false;this.binding=false;this.closed=true;return {bookId:this.bookId,closed:true,tabCleanup:this.tabCleanup};}finally{this.closing=false;}
+    try{if(this.statusPromise)await this.statusPromise;if(this.state.pending)throw new Error('任务未确认终止；先 pause 再等待 status');if(this.windowHelperCleanupSupported&&this.connection&&!this.dead){try{const result=await this.invokeBridge('cleanupWindowHelper');if(result.bookId!==this.bookId||typeof result.cleanup?.removed!=='boolean'||Object.keys(result.cleanup).some(key=>!['removed','reason'].includes(key)))throw new Error('窗口辅助页清理回执无效');this.state.windowHelperCleanup=result.cleanup;}catch{this.state.windowHelperCleanup={removed:false,reason:'cleanup-unconfirmed'};}}await this.cleanupOwnedTab();await this.persist();if(this.connection)await this.connection.close();this.connection=null;this.dead=false;this.binding=false;this.closed=true;return {bookId:this.bookId,closed:true,tabCleanup:this.tabCleanup,...(this.state.windowHelperCleanup?{windowHelperCleanup:this.state.windowHelperCleanup}:{})};}finally{this.closing=false;}
   }
 }

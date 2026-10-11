@@ -13,7 +13,7 @@ export async function startRecorderService({root=defaultRoot,configPath='config/
   root=path.resolve(root);const config=await loadRecorderConfig(root,configPath),directory=path.join(root,'data/persistent-executor');
   const lockPath=path.join(root,'data/new-system-browser/extension-Default.lock');await prepareRuntimeDirectory(root,directory);await prepareRuntimeDirectory(root,path.dirname(lockPath));await writableWorkspacePath(root,lockPath);
   const lease=await acquirePersistentLock(lockPath);const key=randomBytes(32).toString('hex');
-  const session=new PersistentRecorderSession({root,bookId:config.bookId,statePath:sessionStatePath,connect:async bridge=>{let connected;await lease.markConnecting();try{connected=await connect(bridge);await lease.updateServicePid(connected.servicePid);return connected;}catch(error){if(error.code==='MCP_EXIT_UNCONFIRMED'&&error.servicePid)await lease.updateServicePid(error.servicePid);else{if(connected)await connected.close();await lease.confirmNoService();}throw error;}}});
+  const session=new PersistentRecorderSession({root,bookId:config.bookId,focusMode:config.focusMode,windowMode:config.windowMode,statePath:sessionStatePath,connect:async bridge=>{let connected;await lease.markConnecting();try{connected=await connect(bridge);await lease.updateServicePid(connected.servicePid);return connected;}catch(error){if(error.code==='MCP_EXIT_UNCONFIRMED'&&error.servicePid)await lease.updateServicePid(error.servicePid);else{if(connected)await connected.close();await lease.confirmNoService();}throw error;}}});
   try{await session.initialize();}catch(error){await lease.release();throw error;}
   let shuttingDown=false,heartbeat;const controlFile=path.join(directory,'control.json');
   async function shutdown(){if(shuttingDown)return;shuttingDown=true;try{await writableWorkspacePath(root,lockPath);await writableWorkspacePath(root,controlFile);const closed=await session.close();await lease.confirmNoService();await lease.release();clearInterval(heartbeat);await fs.unlink(controlFile).catch(error=>{if(error.code!=='ENOENT')throw error;});server.close();return closed;}catch(error){shuttingDown=false;throw error;}}
@@ -29,7 +29,7 @@ export async function startRecorderService({root=defaultRoot,configPath='config/
     }catch(error){return send(409,{error:safeDiagnosticMessage(error.message),status:session.snapshot()});}
   });
   try{await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port??config.port,'127.0.0.1',resolve);});}catch(error){await lease.release();throw error;}
-  const control={schemaVersion:1,bookId:config.bookId,sessionPath:session.statePath,pid:process.pid,port:server.address().port,key};try{await writableWorkspacePath(root,controlFile);await fs.writeFile(controlFile,JSON.stringify(control));}catch(error){server.close();await lease.release();throw error;}
+  const control={schemaVersion:1,bookId:config.bookId,focusMode:session.focusMode,windowMode:session.windowMode,sessionPath:session.statePath,pid:process.pid,port:server.address().port,key};try{await writableWorkspacePath(root,controlFile);await fs.writeFile(controlFile,JSON.stringify(control));}catch(error){server.close();await lease.release();throw error;}
   heartbeat=setInterval(()=>{if(!shuttingDown&&session.connection&&!session.busy)session.status().catch(()=>{});},3000);heartbeat.unref();
   log('常驻执行器已启动：127.0.0.1:'+control.port+'，书 '+config.bookId+'；尚未连接或写入网页。');return {session,server,shutdown,controlFile};
 }

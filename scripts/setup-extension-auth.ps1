@@ -24,13 +24,15 @@ try {
   [IO.Directory]::CreateDirectory($storeDirectory) | Out-Null
   $tempPath = Join-Path $storeDirectory ([Guid]::NewGuid().ToString() + '.tmp')
   [IO.File]::WriteAllText($tempPath, ($stored | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
-  if (Test-Path -LiteralPath $storePath) { [IO.File]::Replace($tempPath, $storePath, $null) } else { [IO.File]::Move($tempPath, $storePath) }
+  # Windows PowerShell 5 converts $null to an empty string for this overload.
+  if (Test-Path -LiteralPath $storePath) { [IO.File]::Replace($tempPath, $storePath, [System.Management.Automation.Language.NullString]::Value) } else { [IO.File]::Move($tempPath, $storePath) }
   $tempPath = $null
   $fileAcl = [Security.AccessControl.FileSecurity]::new()
   $fileAcl.SetAccessRuleProtection($true, $false)
   $rule = [Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'Allow')
   $fileAcl.AddAccessRule($rule)
-  Set-Acl -LiteralPath $storePath -AclObject $fileAcl
+  if ($PSVersionTable.PSEdition -eq 'Desktop') { [IO.File]::SetAccessControl($storePath, $fileAcl) }
+  else { Microsoft.PowerShell.Security\Set-Acl -LiteralPath $storePath -AclObject $fileAcl }
   Write-Host 'Extension authorization saved with Windows CurrentUser DPAPI. Token is not displayed.'
 } catch {
   # Avoid printing exception data that could contain the entered token.

@@ -70,6 +70,8 @@ npm run workflow:crop -- --plan=data/jobs/job-01/crop-plan.json --output=data/jo
 
 ## 配对与草稿
 
+语文教材先读[语文试题格式](chinese-format.md)，在 `records.json` 或 mapping 的 `replacementBlocks` 中确定正文缩进、八空格间隔、完整选项及解析分段；题干与答案 text 块均显式设 `strictSpacing: true`。保持原始 OCR 不变，按最终文本重算原生加点和下划线范围，然后再生成草稿。不能等平台试录后才补这些格式。
+
 把 agent 看图所得写成同一任务目录的 `records.json`。原始 OCR 与人工转录分开保存，正文/答案记录保留各自原图区域。再运行：
 
 ```powershell
@@ -138,5 +140,7 @@ npm run recorder:verify -- --manifest=data/jobs/job-01/batch.approved.json --sta
 ```
 
 `verify` 未给 `--limit` 时核对完整题单，最多 1000 条；显式给 limit 只核对从题单开头起的部分，不能称为整批通过。核对题单与原书覆盖是两项验收。遇到未知保存按[恢复说明](../../../../docs/recovery.md)只读 readback/reconcile 原 taskId 和 pendingPath；这些命令仍走同一 controller 和服务，可加 `--wait --summary`，不能以另一个任务解锁。
+
+语文教材还按[语文格式验收清单](chinese-format.md#保存后验收)核对：精确空格、段落和选项排列、解析分项、纯空段及原生标记都需在保存后的刷新回读中通过；选择题答案正确不能代替排版验收。
 
 最终报告列出授权范围、候选总数/应录/排除/待确认、唯一已保存记录、整批回读结果与证据路径。保存通过与原书覆盖分开说明，未处理的特殊题及未验证的新电脑/新书流程如实列出。暂停或结束时等待 terminal 后 `npm run recorder:stop`，保留所有材料和进度。

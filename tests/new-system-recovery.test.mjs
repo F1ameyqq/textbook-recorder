@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 import { NewSystemAdapter } from '../src/new-system-adapter.mjs';
 import { expectedEditor, renderEditorHtml, createNewSystemRun, reconcileNewSystemRun, runNewSystemBatch } from '../src/new-system-core.mjs';
 
@@ -17,15 +18,26 @@ const pending=()=>({schemaVersion:1,kind:'new-system-append-recovery',status:'pe
 const sideRead=side=>{const expected=expectedEditor(task[side],baseDir);return {html:renderEditorHtml(task[side],baseDir),text:expected.text,paragraphs:expected.paragraphs,images:expected.images.map(value=>({...value,complete:true,width:100,height:80,align:'center'}))};};
 const saved=()=>({status:'found',bookId:100001,target:structuredClone(task.target),recordId:1002,count:2,source:structuredClone(task.source),mainPicNum:31,answerPicNum:244,stem:sideRead('stem'),answer:sideRead('answer')});
 
-async function fixture(t,{missing=false}={}){
+async function fixture(t,{missing=false,fresh=false}={}){
   const dataDir=await fs.mkdtemp(path.join(os.tmpdir(),'textbook-recovery-'));
   t.after(()=>fs.rm(dataDir,{recursive:true,force:true}));
-  const page={context:()=>({}),on(){},off(){},isClosed:()=>false};
+  const browser=new EventEmitter();browser.isConnected=()=>true;
+  const context=new EventEmitter();context.browser=()=>browser;
+  const page=new EventEmitter();page.context=()=>context;page.isClosed=()=>false;
   const adapter=new NewSystemAdapter({page,baseDir,dataDir,source:'fixture'});adapter.bookId=100001;
   adapter._pendingWrite=pending();adapter._uncertain=true;
   let records=missing?structuredClone(prior):[...structuredClone(prior),structuredClone(added)];
   let readback=missing?{status:'missing',bookId:100001,target:structuredClone(task.target),count:1}:saved();
   adapter.read=async(_task,options)=>{assert.equal(options.refresh,true);adapter._nodeID=900320;adapter._directoryRecords=records;return structuredClone(readback);};
+  if(fresh){
+    // Only a real fresh append invocation can establish continuous observation.
+    adapter._pendingWrite=null;adapter._uncertain=false;
+    adapter.directory=async()=>{adapter._directoryRecords=structuredClone(prior);adapter._nodeID=900320;};
+    adapter._navigateSources=async()=>[31,244];adapter._clipboardPreflight=async()=>{};
+    page.waitForFunction=async()=>{};page.locator=()=>({});adapter._click=async()=>{};
+    adapter._pasteReviewedAnswer=async()=>{};adapter._paste=async()=>{throw new Error('synthetic stem failure');};
+    await assert.rejects(adapter.append(task),error=>error.phase==='stem-native-paste-readback');
+  }
   return {adapter,page,dataDir,records,readback};
 }
 
@@ -66,7 +78,7 @@ test('changed text, superscript, image, answer spacing, prior identity, source, 
 
 test('missing recovery unlocks only an unchanged baseline with live proof that no SAVE was dispatched',async t=>{
   for(const mode of ['no-save','save-dispatched','restored'])await t.test(mode,async child=>{
-    const {adapter}=await fixture(child,{missing:true});
+    const {adapter}=await fixture(child,{missing:true,fresh:mode!=='restored'});
     adapter._pendingWrite.observedSaveRequests=mode==='save-dispatched'?1:0;
     const options=mode==='restored'?{pendingWrite:adapter.pendingWrite}:{};
     const result=await adapter.reconcile(task,options);
@@ -130,7 +142,7 @@ test('explicit saved recovery records independent confirmation without forging a
 });
 
 test('explicit not-saved recovery resets only proven unsaved attempts while preserving history and rejecting unknown outcomes',async t=>{
-  const {adapter}=await fixture(t,{missing:true});adapter._pendingWrite.observedSaveRequests=0;
+  const {adapter}=await fixture(t,{missing:true,fresh:true});adapter._pendingWrite.observedSaveRequests=0;
   const recovery=await adapter.reconcile(task);
   const state=failedRun();
   reconcileNewSystemRun({manifest,state,taskId:task.id,recovery,baseDir});

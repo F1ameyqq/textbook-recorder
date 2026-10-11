@@ -147,6 +147,23 @@ test('rich replacements preserve exact scripts and eight answer spaces; latex is
   assert.throws(()=>prepareDraftBatch(f.paired,unchecked,f.baseDir),/agentReview/);
 });
 
+test('explicit answer analysis layout preserves paired provenance and still requires new pending approval',async t=>{
+  const f=await fixture(t), mapping=copied(f.mapping), originalPaired=copied(f.paired);
+  const blocks=[{type:'text',text:'1. B'},{type:'analysis-separator'},{type:'text',text:'1. 完整解析'}];
+  mapping.placements[0].replacementBlocks={answer:blocks};
+  mapping.placements[0].agentReview={checkedAgainstOriginal:true,evidence:'合成答案与解析内容已检查，指定答案分区。'};
+  const result=prepareDraftBatch(f.paired,mapping,f.baseDir);
+  assert.equal(result.report.valid,true);
+  assert.deepEqual(result.manifest.tasks[0].answer.blocks,blocks);
+  assert.deepEqual(f.paired,originalPaired);
+  assert.deepEqual(result.manifest.tasks[0].preparation.records.answer,f.paired.tasks[0].answer);
+  assert.deepEqual(result.manifest.tasks[0].review.issues,[]);
+  assert.equal(result.manifest.tasks[0].review.status,'pending');
+  assert.equal(result.report.readyForExecution,false);
+  const bad=copied(mapping);bad.placements[0].replacementBlocks={stem:blocks};
+  assert.equal(prepareDraftBatch(f.paired,bad,f.baseDir).report.valid,false);
+});
+
 test('scope mismatch, target reuse and dropped placements cannot become ready',async t=>{
   const f=await fixture(t), mismatched=copied(f.input); mismatched.answers[1].unit='其他节';
   const result=prepareDraftBatch(preparePairedBatch(mismatched),f.mapping,f.baseDir); assert.ok(result.manifest.tasks[1].review.issues.includes('declared_answer_scope_mismatch'));

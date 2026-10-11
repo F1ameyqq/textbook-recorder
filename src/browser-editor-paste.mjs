@@ -1,10 +1,14 @@
 import { insertReviewedEditorHtml } from './browser-editor-command.mjs';
+import { validateBrowserFocusMode, validateBrowserWindowMode } from './browser-focus.mjs';
 
 /** Preserve the full reviewed fragment, then paste only each native formula.
  * The platform's whole-fragment paste formatter removes unit spaces after sup.
  * A formula-only paste renders MathJax without reformatting ordinary text.
  */
-export async function pasteReviewedEditorHtml(page, selector, html, {replace=false,timeoutMs=20000,guard=async()=>{},allowGeneratedTrailingEmptyParagraph=false,protectFormulaBoundarySpaces=false}={}) {
+export async function pasteReviewedEditorHtml(page, selector, html, {replace=false,timeoutMs=20000,guard=async()=>{},allowGeneratedTrailingEmptyParagraph=false,protectFormulaBoundarySpaces=false,focusMode='foreground',windowMode='normal'}={}) {
+  validateBrowserFocusMode(focusMode);
+  validateBrowserWindowMode(windowMode);
+  if (focusMode === 'foreground' && windowMode === 'minimized') throw new Error('minimized 窗口只允许 background 模式');
   if (!page || typeof page.locator!=='function' || typeof selector!=='string' || !selector || typeof html!=='string' || !html.trim() || html.includes('\0') || typeof replace!=='boolean' || typeof allowGeneratedTrailingEmptyParagraph!=='boolean' || typeof protectFormulaBoundarySpaces!=='boolean' || !Number.isSafeInteger(timeoutMs) || timeoutMs<1) throw new Error('Invalid reviewed paste arguments');
   const editor=page.locator(selector);
   if(await editor.count()!==1) throw new Error('Paste requires one explicit editor');
@@ -35,9 +39,10 @@ export async function pasteReviewedEditorHtml(page, selector, html, {replace=fal
     }
     return {html:fragment.innerHTML,protectedAnswerSeparators,protectedFormulaBoundarySpaces,formulas:formulas.map(node=>({html:node.outerHTML,plain:node.textContent,latex:node.textContent.trim().slice(1,-1),previousText:node.previousSibling?.nodeType===3?node.previousSibling.nodeValue:null})),empty:!element.textContent.trim()&&!element.querySelector('img,svg,math-tex,.formula-node')};
   },{html,protectFormulaBoundarySpaces});
+  if (focusMode === 'background' && parsed.formulas.length) throw new Error('后台模式禁止需要原生剪贴板的公式粘贴；尚未修改编辑框');
   if(!replace&&!parsed.empty)throw new Error('Paste append requires an empty editor');
   await guard();
-  const inserted=await insertReviewedEditorHtml(page,selector,parsed.html,{replace,timeoutMs,guard,allowGeneratedTrailingEmptyParagraph});
+  const inserted=await insertReviewedEditorHtml(page,selector,parsed.html,{replace,timeoutMs,guard,allowGeneratedTrailingEmptyParagraph,focusMode,windowMode});
   const inputEvents=[...inserted.inputEvents];
   let formulaPasteCount=0;
   for(let index=0;index<parsed.formulas.length;index++) {

@@ -1,11 +1,17 @@
 import { checkedPointerClick } from './checked-pointer-click.mjs';
+import { assertEditorNativeEmphasis } from './native-emphasis.mjs';
+import { activateRecorderPage, validateBrowserFocusMode, validateBrowserWindowMode } from './browser-focus.mjs';
+import { requireRecorderDocumentReady, assertRecorderDocumentSnapshot } from './browser-document-state.mjs';
 
 /**
  * Insert already reviewed HTML through the browser's editing command.
  * The caller remains responsible for book/record scope and server receipts.
  * This uses normal DOM/keyboard APIs, not an editor framework or save endpoint.
  */
-export async function insertReviewedEditorHtml(page, selector, html, { replace = false, timeoutMs = 20000, guard = async () => {}, allowGeneratedTrailingEmptyParagraph = false } = {}) {
+export async function insertReviewedEditorHtml(page, selector, html, { replace = false, timeoutMs = 20000, guard = async () => {}, allowGeneratedTrailingEmptyParagraph = false, focusMode = 'foreground', windowMode = 'normal' } = {}) {
+  validateBrowserFocusMode(focusMode);
+  validateBrowserWindowMode(windowMode);
+  if (focusMode === 'foreground' && windowMode === 'minimized') throw new Error('minimized 窗口只允许 background 模式');
   if (!page || typeof page.locator !== 'function') throw new Error('A Playwright page is required');
   if (typeof selector !== 'string' || !selector.trim()) throw new Error('An explicit editor selector is required');
   if (typeof html !== 'string' || !html.trim() || html.includes('\0')) throw new Error('Reviewed HTML must be nonempty and contain no NUL');
@@ -19,11 +25,26 @@ export async function insertReviewedEditorHtml(page, selector, html, { replace =
   if (!initial.editable) throw new Error('Target is not contenteditable');
   if (!replace && !initial.empty) throw new Error('Append command requires an empty editor; no content changed');
 
-  await page.bringToFront();
-  await checkedPointerClick(page, editor, {timeout:timeoutMs,guard});
+  await activateRecorderPage(page, focusMode, {windowMode,guard});
+  await checkedPointerClick(page, editor, {timeout:timeoutMs,guard,focusMode,windowMode});
   // Genuine keyboard input establishes a browser selection/caret in the editor.
   await editor.press(replace ? 'Control+KeyA' : 'Control+Home');
-  const result = await editor.evaluate((element, { html, replace }) => {
+  await guard();
+  const backgroundBinding = focusMode === 'background'
+    ? await requireRecorderDocumentReady(page, {focusMode,windowMode,guard}) : null;
+  const result = await editor.evaluate((element, { html, replace, backgroundBinding }) => {
+    // Recheck actionability synchronously before editing, after trusted keyboard
+    // input. A lost focus, hidden document or changed target must stop here.
+    if (backgroundBinding) {
+      if (location.href !== backgroundBinding.url || performance.timeOrigin !== backgroundBinding.timeOrigin
+          || !['visible','hidden'].includes(document.visibilityState) || document.prerendering
+          || !['interactive','complete'].includes(document.readyState)
+          || !backgroundBinding.minimized && document.visibilityState !== 'visible') throw new Error('Editor document changed after background-window verification');
+    } else if (document.visibilityState !== 'visible' || !document.hasFocus()) throw new Error('Editor document is hidden or has lost DOM focus');
+    const rect = element.getBoundingClientRect(), x = rect.x + rect.width / 2, y = rect.y + rect.height / 2;
+    const style = getComputedStyle(element), hit = document.elementFromPoint(x, y);
+    if (!element.isConnected || rect.width <= 0 || rect.height <= 0 || style.display === 'none' || style.visibility === 'hidden'
+        || x < 0 || y < 0 || x >= innerWidth || y >= innerHeight || !(hit === element || hit && element.contains(hit))) throw new Error('Editor is hidden, outside the viewport or covered before insertion');
     const selection = window.getSelection();
     const inside = node => !!node && (node === element || element.contains(node));
     if (!element.isContentEditable || document.activeElement !== element || !selection || selection.rangeCount !== 1 || !inside(selection.anchorNode) || !inside(selection.focusNode)) throw new Error('Active selection is not confined to the target editor');
@@ -49,7 +70,12 @@ export async function insertReviewedEditorHtml(page, selector, html, { replace =
     finally { element.removeEventListener('beforeinput', listener); element.removeEventListener('input', listener); }
     if (!succeeded) throw new Error('Browser insertHTML command declined the insertion');
     return { command:'insertHTML', succeeded, selectionVerified:true, inputEvents };
-  }, { html, replace });
+  }, { html, replace, backgroundBinding });
+  if (backgroundBinding) {
+    const after = await requireRecorderDocumentReady(page, {focusMode,windowMode,guard});
+    assertRecorderDocumentSnapshot(after, backgroundBinding);
+    if (String(after.windowId) !== String(backgroundBinding.windowId)) throw new Error('Editor window identity changed during insertion');
+  }
 
   await page.waitForFunction(({ selector, html }) => {
     const actual = document.querySelector(selector);
@@ -116,6 +142,7 @@ export async function insertReviewedEditorHtml(page, selector, html, { replace =
   }, html);
   const profile=reviewedParagraphCountProfile(checked,allowGeneratedTrailingEmptyParagraph);if(!profile.accepted)checked.errors.unshift('Top-level paragraph count changed');
   if (checked.errors.length) throw new Error('Browser command readback mismatch: ' + checked.errors.join('; '));
+  await assertEditorNativeEmphasis(page,selector,html);
   return { ...result, paragraphCount:checked.paragraphCount, imageCount:checked.imageCount, addedGeneratedTrailingEmptyParagraph:profile.addedGeneratedTrailingEmptyParagraph };
 }
 

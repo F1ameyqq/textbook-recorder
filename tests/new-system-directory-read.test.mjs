@@ -29,9 +29,8 @@ function reloadFixture({showEditorsOnSelection=true,initialSelected=false}={}) {
       if(selected){events.push('reclick-selected-section-with-no-request');return;}
       events.push('select-section'); selected=true; editorsVisible=showEditorsOnSelection;
       for(const listener of listeners.get('request')??[]) listener(request);
-      assert.ok(responseWait,'directory must install a response wait before clicking');
-      assert.equal(responseWait.predicate(response),true,'response must be a new request in the bound scope');
-      responseWait.resolve(response);
+      assert.ok(listeners.get('response')?.length,'directory must install a response observer before clicking');
+      for(const listener of listeners.get('response')??[])listener(response);
     },
   };
   const chapterNode={evaluate:async()=>true,locator:selector=>{assert.equal(selector,'.el-tree-node__content');return {filter:({hasText})=>{assert.ok(hasText.test(target.sectionLabel));return section;}};}};
@@ -39,6 +38,7 @@ function reloadFixture({showEditorsOnSelection=true,initialSelected=false}={}) {
     context:()=>({}),isClosed:()=>false,url:()=>url,
     bringToFront:async()=>{},
     on:(event,listener)=>{if(!listeners.has(event))listeners.set(event,[]);listeners.get(event).push(listener);},
+    off:(event,listener)=>listeners.set(event,(listeners.get(event)??[]).filter(value=>value!==listener)),
     reload:async()=>{events.push('reload');selected=false;editorsVisible=false;},
     locator:selector=>{
       if(selector==='.el-tree-node__content')return {filter:({hasText})=>{assert.ok(hasText.test(target.chapterLabel));return chapter;}};

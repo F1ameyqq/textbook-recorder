@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { validateNewSystemManifest, renderBlockHtml } from './new-system-core.mjs';
+import { assertNativeEmphasis } from './native-emphasis.mjs';
 import { buildReviewDiagnostics, reviewAnchor, reviewText } from './review-issues.mjs';
 import { previewBlock, renderTaskSources, renderReviewDiagnostic, resolvePreviewSourcePages } from './review-preview.mjs';
 
@@ -10,7 +11,7 @@ const CHECKS = ['sourceText', 'answerMatch', 'wholeQuestion', 'format'];
 const CANDIDATE_TYPES = new Set(['question', 'knowledge-construction', 'whole-activity', 'non-question']);
 const escape = value => reviewText(value).replace(/&/gu, '&amp;').replace(/</gu, '&lt;')
   .replace(/>/gu, '&gt;').replace(/"/gu, '&quot;').replace(/'/gu, '&#39;');
-const textOf = block => Array.isArray(block?.parts) ? block.parts.map(reviewText).join('\u00a0'.repeat(8))
+const textOf = block => block?.type === 'analysis-separator' || block?.type === 'image' ? '' : Array.isArray(block?.parts) ? block.parts.map(reviewText).join('\u00a0'.repeat(8))
   : Array.isArray(block?.runs) ? block.runs.map(run => reviewText(run?.text)).join('')
     : reviewText(block?.text);
 const missingAnswerLabel = value => /^(?:原书未提供参考答案|无(?:官方)?(?:参考)?答案|未提供(?:参考)?答案|没有(?:参考)?答案)[。.!！]?$/u.test(reviewText(value).trim());
@@ -29,12 +30,25 @@ function taskHints(task, at, errors, warnings, specialReview) {
     for (const [index, block] of task[side].blocks.entries()) {
       if (!object(block)) continue;
       const where = `${at}.${side}.blocks[${index}]`;
+      // Only the explicit, range-bound native contract may pass this gate.
+      // Validate before image/separator early returns so misplaced metadata
+      // cannot silently disappear from inspection or preview.
+      let invalidEmphasis = false;
+      if (block.emphasis !== undefined) {
+        try { assertNativeEmphasis(block); }
+        catch (error) {
+          invalidEmphasis = true;
+          errors.push(`${where}: 原生加点/下划线元数据无效：${reviewText(error?.message)}`);
+          specialReview.push({ taskId: task.id, side, blockIndex: index, reason: 'unsupported-native-format', resolved: false });
+        }
+      }
       if (block.type === 'image') {
         if (!['diagram', 'table'].includes(block.purpose)) {
           errors.push(`${where}: 图片 purpose 必须是 diagram/table；whole-question 整题截图禁止`);
         }
         continue;
       }
+      if (block.type === 'analysis-separator') continue;
       const text = textOf(block);
       if (/\uFFFD/u.test(text)) {
         errors.push(`${where}: 含 Unicode 替换字符 U+FFFD，须重新对照原图辨字，人工确认不能解除`);
@@ -53,14 +67,14 @@ function taskHints(task, at, errors, warnings, specialReview) {
           ...(resolved ? { resolution: 'human-review-metadata', sourceVerifiedByTool: false } : {}) });
       }
       if (/[\u0323\u0305]/u.test(text)) {
-        errors.push(`${where}: 组合加点/横线字符需要专项渲染审校，通用输入未实现原生强调`);
+        errors.push(`${where}: 组合加点/横线字符需要专项渲染审校，组合形式未实现原生强调；须使用明确范围的原生标记`);
         specialReview.push({ taskId: task.id, side, blockIndex: index, reason: 'combining-emphasis', resolved: false });
       }
       if (['formula', 'math-tex', 'emphasis'].includes(block.type) || block.latex !== undefined
-          || block.emphasis !== undefined || (Array.isArray(block.runs)
-            && block.runs.some(run => ['formula', 'math-tex', 'emphasis'].includes(run?.type)))) {
+          || (Array.isArray(block.runs)
+            && block.runs.some(run => ['formula', 'math-tex', 'emphasis'].includes(run?.type) || run?.emphasis !== undefined))) {
         errors.push(`${where}: 复杂原生公式/强调超出通用 core 能力，需专项审校和独立执行器`);
-        specialReview.push({ taskId: task.id, side, blockIndex: index, reason: 'unsupported-native-format', resolved: false });
+        if (!invalidEmphasis) specialReview.push({ taskId: task.id, side, blockIndex: index, reason: 'unsupported-native-format', resolved: false });
       }
     }
   }
@@ -177,7 +191,7 @@ export function inspectReviewedBatch(manifest, baseDir = process.cwd()) {
       approvedTasks: tasks.filter(task => task?.review?.status === 'approved').length,
       specialReviewRisks: specialReview.length, unresolvedSpecialReview: unresolvedSpecialReview.length },
     limitations: ['作答要求、原图全文、答案归属和题目边界依赖人工审校；元数据一致不证明语义正确',
-      '通用 core 只支持文本、上下标和 PNG/JPEG 题图；复杂原生公式/强调需要专项通路',
+      '通用 core 支持文本、上下标、PNG/JPEG 题图及明确范围的原生加点/下划线；复杂公式和其他强调仍需专项通路',
       'specialReview 确认只记录人工声明及冻结题单绑定，不证明工具已核验原图语义',
       '本报告和预览不会批准题单，也不证明平台保存或实际页面渲染'],
   };

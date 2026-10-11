@@ -6,21 +6,24 @@ import os from 'node:os';
 import {EventEmitter} from 'node:events';
 import {ensureRecorderService} from '../scripts/ensure-recorder-service.mjs';
 
+const fixtureModes={focusMode:'background',windowMode:'normal'};
+
 async function workspace(t){
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'recorder-start-'));
   t.after(async()=>{assert.equal(path.dirname(root),path.resolve(os.tmpdir()));assert.ok(path.basename(root).startsWith('recorder-start-'));await fs.rm(root,{recursive:true,force:true});});
   await fs.mkdir(path.join(root,'config'));await fs.mkdir(path.join(root,'scripts'));await fs.mkdir(path.join(root,'data/persistent-executor'),{recursive:true});
-  await fs.writeFile(path.join(root,'config/recorder.json'),JSON.stringify({bookId:101,port:8789}));
+  await fs.writeFile(path.join(root,'config/recorder.json'),JSON.stringify({bookId:101,port:8789,...fixtureModes}));
   await fs.writeFile(path.join(root,'scripts/run-recorder-service.mjs'),'// owned local service fixture');return root;
 }
-const control=root=>({schemaVersion:1,bookId:101,pid:50001,port:8789,key:'b'.repeat(64),sessionPath:path.join(root,'data/persistent-executor/session.json')});
+const control=root=>({schemaVersion:1,bookId:101,pid:50001,port:8789,...fixtureModes,key:'b'.repeat(64),sessionPath:path.join(root,'data/persistent-executor/session.json')});
 async function putControl(root,value=control(root)){await fs.writeFile(path.join(root,'data/persistent-executor/control.json'),JSON.stringify(value));}
-const health=root=>async(url,options)=>{assert.ok(url.endsWith('/health'));assert.equal(options.headers['x-recorder-key'],'b'.repeat(64));return {ok:true,json:async()=>({bookId:101,sessionPath:control(root).sessionPath,connection:'disconnected',pending:null,writeBlocked:false})};};
+const health=root=>async(url,options)=>{assert.ok(url.endsWith('/health'));assert.equal(options.headers['x-recorder-key'],'b'.repeat(64));return {ok:true,json:async()=>({bookId:101,...fixtureModes,sessionPath:control(root).sessionPath,connection:'disconnected',pending:null,writeBlocked:false})};};
 
 test('reuses the authenticated local service without spawning or connecting a browser',async t=>{
   const root=await workspace(t);await putControl(root);let launches=0;
   const result=await ensureRecorderService(root,{alive:()=>true,fetchImpl:health(root),spawnProcess:()=>{launches++;throw new Error('must not spawn');}});
   assert.equal(result.reused,true);assert.equal(result.connection,'disconnected');assert.equal(launches,0);assert.doesNotMatch(JSON.stringify(result),/bbbbbbbb/u);
+  assert.equal(result.focusMode,fixtureModes.focusMode);assert.equal(result.windowMode,fixtureModes.windowMode);
 });
 
 test('a single hidden supervisor launch is reused by later commands',async t=>{

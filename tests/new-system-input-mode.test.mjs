@@ -21,6 +21,7 @@ function mockPage({ focus = true, stemEditable = true, answerEditable = true, co
   const elements = selector => selector === stemSelector ? Array(stemCount).fill(stem)
     : selector === answerSelector ? Array(answerCount).fill(answer) : [];
   const document = {
+    visibilityState: 'visible',
     hasFocus: () => focus,
     querySelectorAll: elements,
     querySelector: selector => elements(selector)[0] ?? null,

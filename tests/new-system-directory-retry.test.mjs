@@ -29,7 +29,7 @@ async function fixture(t,{failures=[visibilityError()],saved=true,wrongReceipt=f
   const dataDir=await fs.mkdtemp(path.join(os.tmpdir(),'directory-retry-'));t.after(()=>fs.rm(dataDir,{recursive:true,force:true}));
   const events=[];let url=initialUrl,directoryCalls=0,saveCalls=0,plusCalls=0;
   const page={context:()=>({}),isClosed:()=>false,url:()=>url,on:()=>{},bringToFront:async()=>events.push('front'),reload:async()=>events.push('reload'),
-    evaluate:async()=>{events.push('diagnostic-dom');if(captureFails)throw new Error('diagnostic DOM unavailable');if(changeBookDuringCapture)url=bookUrl.replace('100001','146005');return diagnosticDom?copy(diagnosticDom):{readyState:'complete',title:'fixture',visibility:'visible',focused:true,treeCount:1,treeNodeCount:0,contentCount:0,visibleContentCount:0,roots:[],chapterCount:0,chapters:[],sectionCount:0,sections:[],ancestors:[],loading:[]};},
+    evaluate:async fn=>{if(/document\.visibilityState\s*===\s*['"]visible['"]/u.test(fn.toString()))return true;events.push('diagnostic-dom');if(captureFails)throw new Error('diagnostic DOM unavailable');if(changeBookDuringCapture)url=bookUrl.replace('100001','146005');return diagnosticDom?copy(diagnosticDom):{readyState:'complete',title:'fixture',visibility:'visible',focused:true,treeCount:1,treeNodeCount:0,contentCount:0,visibleContentCount:0,roots:[],chapterCount:0,chapters:[],sectionCount:0,sections:[],ancestors:[],loading:[]};},
     locator:()=>{throw new Error('no save or Plus locator may be requested in this fixture');},
   };
   const adapter=new NewSystemAdapter({page,inputMode:'browser-command',dataDir});adapter.bookId=100001;
@@ -88,6 +88,25 @@ async function standaloneDiagnostics(f) {
 function priorTerminal(f,status='completed') {
   f.adapter._pendingWrite={schemaVersion:1,kind:'new-system-append-recovery',bookId:100001,nodeID:900320,status,created:true,task:{...copy(approvedTask),id:'previous-task',target:{...target,sectionLabel:'上一节'}},observedSaveRequests:1,receipt:copy(f.receipt),priorRecords:[],phase:status,updatedAt:'2026-10-07T00:00:00.000Z',...(status==='reconciled'?{recovery:{outcome:'saved',recordId:1001,checkedAt:'2026-10-07T00:00:00.000Z'}}:{})};
 }
+
+test('a refresh root timeout preserves a durable read-only diagnostic without another reload or selection',async t=>{
+  const f=await prewriteFixture(t),original=visibilityError('directory-root');
+  f.adapter._reloadForFreshRead=async()=>{f.events.push('reload');throw original;};
+  await assert.rejects(f.adapter.read(approvedTask,{refresh:true}),error=>error===original && typeof error.directoryVisibilityEvidencePath==='string');
+  const [diagnostic]=await standaloneDiagnostics(f);
+  assert.equal(diagnostic.phase,'refresh-directory-root');assert.equal(diagnostic.captureComplete,true);
+  assert.equal(diagnostic.savedReceiptBound,false);assert.equal(diagnostic.prewriteEmptyTreeRetryEligible,false);
+  assert.equal(f.events.filter(event=>event==='reload').length,1);assert.equal(f.directoryCalls,0);
+  assert.equal(f.saveCalls,0);assert.equal(f.plusCalls,0);assert.equal(f.adapter._pendingWrite,null);
+});
+
+test('root diagnostic failure retains the original timeout and partial evidence without retry',async t=>{
+  const f=await prewriteFixture(t,{captureFails:true}),original=visibilityError('directory-root');
+  f.adapter._reloadForFreshRead=async()=>{f.events.push('reload');throw original;};
+  await assert.rejects(f.adapter.read(approvedTask,{refresh:true}),error=>error===original && error.directoryDiagnosticError==='diagnostic DOM unavailable');
+  const [diagnostic]=await standaloneDiagnostics(f);assert.equal(diagnostic.captureComplete,false);assert.equal(diagnostic.phase,'refresh-directory-root');
+  assert.equal(f.events.filter(event=>event==='reload').length,1);assert.equal(f.directoryCalls,0);assert.equal(f.saveCalls,0);assert.equal(f.plusCalls,0);
+});
 
 test('approved pre-write complete empty tree retries once through normal read with no save or Plus',async t=>{
   const f=await prewriteFixture(t);const result=await f.adapter.read(approvedTask,{refresh:true});

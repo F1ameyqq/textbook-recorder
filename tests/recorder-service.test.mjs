@@ -18,17 +18,28 @@ async function fakeSession(t,{handleStart,failTransport=false,root:workspaceRoot
   const root=workspaceRoot??await workspace(t),canonicalRoot=await fs.realpath(root),args=await putManifest(root),starts=[],connections=[];let job=null,live=new Set(),connects=0;
   const connect=async()=>{connects++;const callbacks=[];const servicePid=60000+connects;live.add(servicePid);const connection={servicePid,authConfigured:true,onClosed:fn=>callbacks.push(fn),disconnect:()=>callbacks.forEach(fn=>fn()),close:async()=>{live.delete(servicePid);callbacks.forEach(fn=>fn());},client:{listTools:async()=>({tools:[{name:'browser_tabs',inputSchema:{properties:{action:{enum:['list','select']}}}},{name:'browser_run_code_unsafe',inputSchema:{properties:{code:{type:'string'}}}}]}),callTool:async({name,arguments:input})=>{
     if(name==='browser_tabs')return {structuredContent:input.action==='list'?{tabs:[{index:0,url:recorderBookUrl(BOOK)}]}:{bookId:BOOK}};
-    const match=input.code.match(/page\.__persistentRecorder\.(\w+)\((.*)\); \}/u);assert.ok(match);if(match[1]==='status')return {structuredContent:{bookId:BOOK,job:copy(job)}};if(match[1]==='pause')return {structuredContent:{bookId:BOOK,stopRequested:true}};
+    const match=input.code.match(/page\.__persistentRecorder\.(\w+)\((.*)\); \}/u);assert.ok(match);if(match[1]==='status')return {structuredContent:{bookId:BOOK,focusMode:'foreground',windowMode:'normal',job:copy(job)}};if(match[1]==='pause')return {structuredContent:{bookId:BOOK,stopRequested:true}};
     const command=JSON.parse(match[2]);starts.push(command);if(failTransport)throw new Error('transport result lost');job={id:command.id,action:command.action,running:true,terminal:false};const result=handleStart?await handleStart(command,canonicalRoot):{bookId:BOOK,uncertain:false};if(result!==undefined)job={...job,running:false,terminal:true,result};return {structuredContent:{bookId:BOOK,id:command.id,started:true}};
   }}};connections.push(connection);return connection;};
-  const session=new PersistentRecorderSession({root,bookId:BOOK,connect,alive:pid=>live.has(pid),resolveAuth:async()=>({authConfigured:true})});await session.initialize();return {root,args,session,starts,connections,get connects(){return connects;},setJob:value=>{job=value;}};
+  const session=new PersistentRecorderSession({root,bookId:BOOK,focusMode:'foreground',connect,alive:pid=>live.has(pid),resolveAuth:async()=>({authConfigured:true})});await session.initialize();return {root,args,session,starts,connections,get connects(){return connects;},setJob:value=>{job=value;}};
 }
 
 test('bookId is required; fixed origin and default browser-command are enforced',()=>{
   assert.throws(()=>validateRecorderConfig({}));assert.throws(()=>new PersistentRecorderSession({root:process.cwd()}));
-  assert.deepEqual(validateRecorderConfig({bookId:BOOK}),{schemaVersion:1,bookId:BOOK,port:8789,origin:'https://easylearn.baidu.com',inputMode:'browser-command'});
+  assert.deepEqual(validateRecorderConfig({bookId:BOOK}),{schemaVersion:1,bookId:BOOK,port:8789,origin:'https://easylearn.baidu.com',inputMode:'browser-command',focusMode:'background',windowMode:'normal'});
   for(const value of [{bookId:BOOK,origin:'https://example.com'},{bookId:BOOK,inputMode:'native-paste'},{bookId:BOOK,port:0}])assert.throws(()=>validateRecorderConfig(value));
   assertRecorderPage(recorderBookUrl(BOOK),BOOK);assert.throws(()=>assertRecorderPage(recorderBookUrl(BOOK+1),BOOK));assert.throws(()=>assertRecorderPage(recorderBookUrl(BOOK)+'&textbookID='+BOOK,BOOK));
+});
+test('shared modes default to background/normal and minimization requires explicit configuration',()=>{
+  const background=validateRecorderConfig({bookId:BOOK,focusMode:'background'});assert.equal(background.windowMode,'normal');
+  const session=new PersistentRecorderSession({root:process.cwd(),bookId:BOOK});assert.equal(session.focusMode,'background');assert.equal(session.windowMode,'normal');
+  const foreground=validateRecorderConfig({bookId:BOOK,focusMode:'foreground'});assert.equal(foreground.focusMode,'foreground');assert.equal(foreground.windowMode,'normal');
+  assert.equal(validateRecorderConfig({bookId:BOOK,focusMode:'background',windowMode:'normal'}).windowMode,'normal');
+  assert.equal(validateRecorderConfig({bookId:BOOK,windowMode:'minimized'}).windowMode,'minimized');
+  for(const changes of [{focusMode:null},{focusMode:'hidden'},{windowMode:null},{windowMode:'hidden'},{focusMode:'foreground',windowMode:'minimized'}]){
+    assert.throws(()=>validateRecorderConfig({bookId:BOOK,...changes}),/focusMode|windowMode|minimized/u);
+    assert.throws(()=>new PersistentRecorderSession({root:process.cwd(),bookId:BOOK,...changes}),/focusMode|windowMode|minimized/u);
+  }
 });
 test('typed commands reject historical repairs, arbitrary script and escaped file paths',()=>{
   for(const command of [{action:'repair-existing'},{action:'execute',args:{manifest:'../batch.json'}},{action:'probe',args:{code:'save()'}},{action:'reconcile',args:{manifest:'data/batch.json'}}])assert.throws(()=>validateRecorderCommand(command,process.cwd()));
@@ -57,6 +68,23 @@ test('a bound successful readonly reconciliation unlocks, incomplete proof does 
   let complete=false;const fake=await fakeSession(t,{handleStart:async(command,root)=>command.action==='execute'?{bookId:BOOK,uncertain:true,pendingWrite:{task:{id:'synthetic-1'}}}:{bookId:BOOK,taskId:'synthetic-1',manifestPath:path.join(root,'data/batch.json'),statePath:path.join(root,'data/run.json'),writePerformed:false,uncertain:false,recovery:{outcome:'saved',writeUnlocked:complete,taskId:'synthetic-1',bookId:BOOK,priorRecordsUnchanged:true,targetRecordUnique:true,fullContentCompared:true,recordId:1001}}});
   await fake.session.command({action:'execute',args:fake.args});await fake.session.command({action:'reconcile',args:{...fake.args,taskId:'synthetic-1'}});assert.equal(fake.session.state.writeBlocked,true);
   complete=true;await fake.session.command({action:'reconcile',args:{...fake.args,taskId:'synthetic-1'}});assert.equal(fake.session.state.writeBlocked,false);await fake.session.close();
+});
+
+test('existing-record completion accepts only its original locked task and a full final proof',async t=>{
+  let complete=false;
+  const fake=await fakeSession(t,{handleStart:async(command,root)=>command.action==='execute'
+    ?{bookId:BOOK,uncertain:true,pendingWrite:{task:{id:'synthetic-1'},evidencePath:path.join(root,'data/pending.json')}}
+    :{bookId:BOOK,taskId:'synthetic-1',manifestPath:path.join(root,'data/batch.json'),statePath:path.join(root,'data/run.json'),
+      writePerformed:true,uncertain:false,recovery:{outcome:'saved',writeUnlocked:complete,taskId:'synthetic-1',bookId:BOOK,
+        priorRecordsUnchanged:true,targetRecordUnique:true,fullContentCompared:true,recordId:1001}}});
+  const args={...fake.args,taskId:'synthetic-1',pendingPath:'data/pending.json'};
+  await fs.writeFile(path.join(fake.root,'data/pending.json'),'{}');
+  await assert.rejects(fake.session.command({action:'complete-record-repair',args}),/原已绑定/);
+  await fake.session.command({action:'execute',args:fake.args});
+  await assert.rejects(fake.session.command({action:'complete-record-repair',args:{...args,taskId:'synthetic-2'}}),/原失败/);
+  await fake.session.command({action:'complete-record-repair',args});assert.equal(fake.session.state.writeBlocked,true);
+  complete=true;await fake.session.command({action:'complete-record-repair',args});assert.equal(fake.session.state.writeBlocked,false);
+  await fake.session.close();
 });
 test('a root-junction session unlocks only after complete canonical readonly reconciliation',async t=>{
   const parent=await workspace(t),actual=path.join(parent,'actual'),alias=path.join(parent,'root-alias');await fs.mkdir(actual);
@@ -88,9 +116,9 @@ test('reconnecting a dead reader keeps the old command ID and does not submit it
 
 async function terminal(bridge){const deadline=Date.now()+5000;while(Date.now()<deadline){const result=bridge.status();if(result.job?.terminal)return result.job;await new Promise(resolve=>setTimeout(resolve,5));}throw new Error('owned fake job did not finish');}
 test('verify refreshes once per scope while preserving per-record content/image comparisons and timing',async t=>{
-  const root=await workspace(t),value=manifest(),args=await putManifest(root,value),reads=[];const page={url:()=>recorderBookUrl(BOOK),bringToFront:async()=>{}};
+  const root=await workspace(t),value=manifest(),args=await putManifest(root,value),reads=[];const page={url:()=>recorderBookUrl(BOOK),bringToFront:async()=>{},evaluate:async()=>true};
   const active={source:'production',bookId:BOOK,_directoryKey:null,_directoryRecords:[1,2].map(seqIndex=>({seqIndex,shitiID:1000+seqIndex,nodeID:50,question:'synthetic',answer:'synthetic',mainPicNum:1,answerPicNum:9,haveAnswer:true})),_nodeID:50,connect:async()=>{},_scopeMatches:async()=>true,read:async(task,options)=>{reads.push({record:task.target.record,refresh:options.refresh});active._directoryKey=JSON.stringify([task.target.chapterLabel,task.target.sectionLabel]);return {status:'found',bookId:BOOK,target:task.target,count:2,recordId:1000+task.target.record,source:task.source,stem:{...expectedEditor(task.stem,root),html:renderEditorHtml(task.stem,root)},answer:{...expectedEditor(task.answer,root),html:renderEditorHtml(task.answer,root)}};},append:async()=>{throw new Error('verify must never append');}};
-  const original=active.read,bridge=await installPersistentBridge({page,config:{root,bookId:BOOK},adapterFactory:()=>active});bridge.start({id:'owned-verify',action:'verify',args});const job=await terminal(bridge);
+  const original=active.read,bridge=await installPersistentBridge({page,config:{root,bookId:BOOK,focusMode:'foreground'},adapterFactory:()=>active});bridge.start({id:'owned-verify',action:'verify',args});const job=await terminal(bridge);
   assert.equal(job.error,undefined);assert.equal(job.result.stateStatus,'completed');assert.deepEqual(reads,[{record:1,refresh:true},{record:2,refresh:false}]);assert.equal(active.read,original);assert.ok(job.timings.some(row=>row.phase==='verify-record'&&row.elapsedMs>=0));
   const rows=(await fs.readFile(job.result.readbackEvidence,'utf8')).trim().split('\n').map(JSON.parse);assert.equal(rows.length,2);assert.equal(rows[0].serverSnapshotAt,rows[1].serverSnapshotAt);assert.equal(rows[1].readback.answer.text,'2'+'\u00a0'.repeat(8)+'3');
 });
@@ -119,12 +147,12 @@ test('service refuses an external lock-directory junction without making a lease
 });
 test('bridge rejects an external adapter-recovery directory before adapter construction',async t=>{
   const root=await workspace(t),outside=await workspace(t);await junction(root,'data/persistent-executor/new-system-recovery',outside);let constructed=0;
-  const page={url:()=>recorderBookUrl(BOOK),bringToFront:async()=>{}},bridge=await installPersistentBridge({page,config:{root,bookId:BOOK},adapterFactory:()=>{constructed++;throw new Error('must not construct');}});
+  const page={url:()=>recorderBookUrl(BOOK),bringToFront:async()=>{},evaluate:async()=>true},bridge=await installPersistentBridge({page,config:{root,bookId:BOOK,focusMode:'foreground'},adapterFactory:()=>{constructed++;throw new Error('must not construct');}});
   bridge.start({id:'recovery-junction',action:'probe'});const job=await terminal(bridge);assert.ok(job.error);assert.equal(constructed,0);assert.deepEqual(await fs.readdir(outside),[]);
 });
 test('an external per-job junction is refused by the atomic writer, independently of service entry',async t=>{
   const root=await workspace(t),outside=await workspace(t),args=await putManifest(root);await junction(root,'data/persistent-executor/jobs/atomic-junction',outside);let constructed=0;
-  const page={url:()=>recorderBookUrl(BOOK),bringToFront:async()=>{}},bridge=await installPersistentBridge({page,config:{root,bookId:BOOK},adapterFactory:()=>{constructed++;throw new Error('must not construct');}});
+  const page={url:()=>recorderBookUrl(BOOK),bringToFront:async()=>{},evaluate:async()=>true},bridge=await installPersistentBridge({page,config:{root,bookId:BOOK,focusMode:'foreground'},adapterFactory:()=>{constructed++;throw new Error('must not construct');}});
   bridge.start({id:'atomic-junction',action:'verify',args});const job=await terminal(bridge);assert.ok(job.error);assert.ok(job.evidenceError);assert.equal(constructed,0);assert.deepEqual(await fs.readdir(outside),[]);
 });
 test('bounded stopped runs are successful supervision outcomes, with limit versus pause recorded',async t=>{

@@ -1,9 +1,10 @@
 import fs from 'node:fs/promises';
 import {realpathSync} from 'node:fs';
 import path from 'node:path';
+import {validateBrowserFocusMode,validateBrowserWindowMode} from './browser-focus.mjs';
 
 export const PLATFORM_ORIGIN='https://easylearn.baidu.com';
-export const TASK_ACTIONS=['probe','collect','verify','execute','readback','reconcile'];
+export const TASK_ACTIONS=['probe','collect','verify','execute','readback','reconcile','complete-record-repair'];
 export const CONTROL_ACTIONS=[...TASK_ACTIONS,'pause','close','status'];
 function withinWorkspace(root,candidate,allowRoot=false){
   const relative=path.relative(root,candidate);
@@ -53,14 +54,16 @@ export async function writableWorkspacePath(root,file){
 }
 export async function prepareRuntimeDirectory(root,directory){const full=path.resolve(root,directory);await writableWorkspacePath(root,path.join(full,'.recorder-path-check'));await fs.mkdir(full,{recursive:true});return existingWorkspaceDirectory(root,full);}
 export function validateRecorderConfig(value){
-  if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!['schemaVersion','bookId','port','origin','inputMode'].includes(key)))throw new Error('录题配置字段无效');
+  if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!['schemaVersion','bookId','port','origin','inputMode','focusMode','windowMode'].includes(key)))throw new Error('录题配置字段无效');
   if(value.schemaVersion!==undefined&&value.schemaVersion!==1)throw new Error('录题配置版本无效');
   if(!Number.isSafeInteger(value.bookId)||value.bookId<=0)throw new Error('config/recorder.json 必须显式指定正整数 bookId');
   const port=value.port??8789;
   if(!Number.isSafeInteger(port)||port<1||port>65535)throw new Error('port 必须为 1–65535');
   if(value.origin!==undefined&&value.origin!==PLATFORM_ORIGIN)throw new Error('只支持指定的录题平台 origin');
   if(value.inputMode!==undefined&&value.inputMode!=='browser-command')throw new Error('共享执行器只使用 browser-command 输入模式');
-  return {schemaVersion:1,bookId:value.bookId,port,origin:PLATFORM_ORIGIN,inputMode:'browser-command'};
+  const focusMode=validateBrowserFocusMode(value.focusMode===undefined?'background':value.focusMode),windowMode=validateBrowserWindowMode(value.windowMode===undefined?'normal':value.windowMode);
+  if(focusMode==='foreground'&&windowMode!=='normal')throw new Error('minimized 只支持 background 模式');
+  return {schemaVersion:1,bookId:value.bookId,port,origin:PLATFORM_ORIGIN,inputMode:'browser-command',focusMode,windowMode};
 }
 export async function loadRecorderConfig(root,configPath='config/recorder.json'){
   let file;try{file=await existingWorkspacePath(root,configPath);return {...validateRecorderConfig(JSON.parse(await fs.readFile(file,'utf8'))),configPath:file};}
@@ -81,8 +84,13 @@ export function validateRecorderCommand(command,root){
   const {action,args={}}=command;
   if(!CONTROL_ACTIONS.includes(action)||!args||typeof args!=='object'||Array.isArray(args))throw new Error('命令或参数无效');
   let continuationGuard;if(command.continuationGuard!==undefined){if(action!=='execute')throw new Error('continuationGuard 仅允许用于 execute');continuationGuard=validateContinuationGuard(command.continuationGuard);}
-  const allowed=action==='collect'?['from','to','output']:action==='probe'?['chapterLabel','sectionLabel','inventory','exportRecords']:['status','pause','close'].includes(action)?[]:['manifest','state',...(['execute','verify'].includes(action)?['limit']:['taskId']),...(action==='readback'?['capture']:[]),...(action==='reconcile'?['pendingPath']:[])];
+  const allowed=action==='collect'?['from','to','output']:action==='probe'?['chapterLabel','sectionLabel','inventory','exportRecords']:['status','pause','close'].includes(action)?[]:['manifest','state',...(['execute','verify'].includes(action)?['limit']:['taskId']),...(action==='readback'?['capture']:[]),...(['reconcile','complete-record-repair'].includes(action)?['pendingPath']:[])];
+  if(action==='complete-record-repair')allowed.push('priorCompletionCommandId');
+  if(action==='reconcile')allowed.push('preAppendFailureCommandId','preStemFailureCommandId','baselineProbeCommandId','historicalNetworkEvidencePath');
   if(Object.keys(args).some(key=>!allowed.includes(key)))throw new Error('命令参数无效，不接受专项修复或代码参数');
+  if(args.priorCompletionCommandId!==undefined&&!/^[a-f0-9-]{36}$/u.test(args.priorCompletionCommandId))throw new Error('原补全命令ID无效');
+  if(args.preAppendFailureCommandId!==undefined||args.preStemFailureCommandId!==undefined||args.baselineProbeCommandId!==undefined){if(action!=='reconcile'||Boolean(args.preAppendFailureCommandId)===Boolean(args.preStemFailureCommandId)||Boolean(args.preStemFailureCommandId)!==Boolean(args.pendingPath)||![args.preAppendFailureCommandId??args.preStemFailureCommandId,args.baselineProbeCommandId].every(value=>typeof value==='string'&&/^[a-f0-9-]{36}$/u.test(value)))throw new Error('提前失败核对须绑定原失败、基线及对应阶段保存意图');}
+  if(args.historicalNetworkEvidencePath!==undefined&&(typeof args.historicalNetworkEvidencePath!=='string'||!args.historicalNetworkEvidencePath.trim()||typeof args.state!=='string'||typeof args.pendingPath!=='string'||args.preAppendFailureCommandId!==undefined||args.preStemFailureCommandId!==undefined||args.baselineProbeCommandId!==undefined))throw new Error('历史网络核对必须绑定原进度、保存意图和冻结证据，不能混用提前失败通路');
   if(action==='collect'){
     if(!Number.isSafeInteger(args.from)||args.from<1||!Number.isSafeInteger(args.to)||args.to<args.from)throw new Error('采集必须明确正整数 from/to 页段');
     if(args.output!==undefined){const full=workspacePath(root,args.output),jobs=workspacePath(root,'data/jobs');if(!/^[A-Za-z0-9_-]{1,80}$/u.test(path.relative(jobs,full)))throw new Error('采集输出必须是 data/jobs/<job> 目录');}
@@ -92,11 +100,12 @@ export function validateRecorderCommand(command,root){
     if(args.inventory&&(args.chapterLabel||args.exportRecords)||args.exportRecords&&!args.sectionLabel)throw new Error('盘点参数冲突');
   }else if(TASK_ACTIONS.includes(action)){
     if(typeof args.manifest!=='string')throw new Error('必须指定已审题单 manifest');
-    if(['readback','reconcile'].includes(action)&&(typeof args.taskId!=='string'||!args.taskId))throw new Error('必须指定原题单 taskId');
+    if(['readback','reconcile','complete-record-repair'].includes(action)&&(typeof args.taskId!=='string'||!args.taskId))throw new Error('必须指定原题单 taskId');
+    if(action==='complete-record-repair'&&(typeof args.state!=='string'||typeof args.pendingPath!=='string'))throw new Error('补全必须指定原进度和待核对意图');
     if(args.limit!==undefined&&(!Number.isSafeInteger(args.limit)||args.limit<1||args.limit>1000))throw new Error('limit 必须为 1–1000');
     if(args.capture!==undefined&&typeof args.capture!=='boolean')throw new Error('capture 必须为布尔值');
   }
-  for(const field of ['manifest','state','pendingPath'])if(args[field]!==undefined)workspacePath(root,args[field]);
+  for(const field of ['manifest','state','pendingPath','historicalNetworkEvidencePath'])if(args[field]!==undefined)workspacePath(root,args[field]);
   if(command.id!==undefined&&!/^[A-Za-z0-9_-]{1,80}$/u.test(command.id))throw new Error('命令 ID 无效');
   return {action,args,...(continuationGuard?{continuationGuard}:{})};
 }

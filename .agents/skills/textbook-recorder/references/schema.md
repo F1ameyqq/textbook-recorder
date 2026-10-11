@@ -47,6 +47,33 @@
 
 中间 blocks 支持 text、latex、image；中间保存 latex 不表示最终执行器有该渲染能力。不要将复杂公式降级为线性表达来消除问题。
 
+### 严格空格与分段
+
+题干和答案的 `type: "text"` 块可显式声明 `strictSpacing: true`，适用于普通 `text`、`runs` 或带 `emphasis` 的文本；`strictSpacing` 仅允许布尔值，不用于图片、上下标独立块或解析分隔线。最终文字保留所需的 ASCII 空格，渲染时将每个半角空格转换为 NBSP；语文正文段首的两个 U+3000 全角空格原样保留，以显示两个汉字宽度。回读仅归一化 NBSP 与换行表示，逐段精确比较，保留 U+3000，不删除首尾空格或压缩间隔。未声明或为 `false` 时保持普通文本默认语义。
+
+语文教材的题干和答案 text 块均显式设置 `strictSpacing: true`，默认排版与验收按[语文试题格式](chinese-format.md)。空格和段落先定稿，再按包含全部空格的最终 `block.text` 计算 `emphasis` 范围，修订后重新绑定批准与保存回读。
+
+### 原生加点字与下划线
+
+普通 `text` 块可声明下面的严格范围接口，题干和答案解析均适用。这个示例在“亵”下加点、在“诗歌”下画线：
+
+```json
+{
+  "type": "text", "text": "1. 亵渎诗歌",
+  "emphasis": {
+    "schemaVersion": 1, "indexUnit": "unicode-code-points",
+    "marks": [
+      {"type": "emphasis-dot", "start": 3, "end": 4, "text": "亵"},
+      {"type": "underline", "start": 5, "end": 7, "text": "诗歌"}
+    ]
+  }
+}
+```
+
+`start`/`end` 相对完整的最终 `block.text`，包含题号和解析前缀，起点包含、终点不包含；范围长度使用 `Array.from(block.text)` 的 Unicode code point 计数。浏览器 DOM 使用 UTF-16，执行器负责转换，材料不能混用单位。每个标记的 `text` 必须等于该范围的原文。只接受这两种标记类型、明确版本与单位；非整数、空区间、越界、同类交叠、错文字、未知字段或类型以及拆开字符的范围均拒绝；不同类型标记可在同一范围共存。一个带 `emphasis` 的块必须是含 `text` 字符串的普通 `text` 块，不能同时有 `runs` 或 `parts`，不能放在图片、上下标或解析分隔线上。
+
+旧 `sourceSegmentText`、`offsetsRelativeTo`、token-only 标记或组合加点/横线字符不能自动转换为执行内容。保留旧材料，对照原图将实际范围写入新的 `replacementBlocks`，生成新 mapping/草稿和新哈希审校决定。最终文本或前缀变化时重新计算范围，不在带范围的文本上沿用会改变字符位置的 OCR 清洗结果。合法结构与预览不证明原图判断或平台实际格式通过；仍需逐图核对、哈希绑定批准和真实保存后的刷新回读。复杂上下分式及其他未支持格式继续阻止执行。
+
 ## mapping 与 pending draft
 
 ```json
