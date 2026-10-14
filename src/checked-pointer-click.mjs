@@ -17,7 +17,7 @@ const sameRect = (left, right) => ['x', 'y', 'width', 'height']
  */
 export async function checkedPointerClick(page, locator, { guard, timeout = 20000, focusMode = 'foreground', windowMode = 'normal', preserveEditorFocus = false, beforeInput } = {}) {
   validateBrowserFocusMode(focusMode); validateBrowserWindowMode(windowMode);
-  if (focusMode === 'foreground' && windowMode === 'minimized') throw new Error('minimized 只支持 background 模式');
+  if (focusMode === 'foreground' && windowMode !== 'normal') throw new Error('minimized/headless 只支持 background 模式');
   if (!page || typeof page.isClosed !== 'function' || !locator || typeof locator.page !== 'function'
       || locator.page() !== page) throw new Error('Checked pointer click requires a locator on the supplied page');
   if (typeof guard !== 'function') throw new Error('Checked pointer click requires a scope guard');
@@ -45,6 +45,7 @@ export async function checkedPointerClick(page, locator, { guard, timeout = 2000
     if (documentBinding) {
       assertRecorderDocumentSnapshot(next, documentBinding);
       if (String(next.windowId) !== String(documentBinding.windowId)) throw new Error('Recorder window identity changed during input checks');
+      if (next.browserBindingId !== documentBinding.browserBindingId) throw new Error('Recorder headless browser identity changed during input checks');
     }
     documentBinding = next;
   };

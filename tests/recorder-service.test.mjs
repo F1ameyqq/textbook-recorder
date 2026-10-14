@@ -124,7 +124,7 @@ test('verify refreshes once per scope while preserving per-record content/image 
 });
 test('local controller stays disconnected for GET status and rejects web-origin/control bypasses',async t=>{
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'recorder-share-test-'));await fs.mkdir(path.join(root,'config'));await fs.writeFile(path.join(root,'config/recorder.json'),JSON.stringify({bookId:BOOK}));assert.equal((await loadRecorderConfig(root)).bookId,BOOK);
-  const service=await startRecorderService({root,port:0,connect:async()=>{throw new Error('This test must not connect a browser');},log:()=>{}});t.after(async()=>{await service.shutdown();assert.equal(path.dirname(root),path.resolve(os.tmpdir()));assert.ok(path.basename(root).startsWith('recorder-share-test-'));await fs.rm(root,{recursive:true,force:true});});const control=JSON.parse(await fs.readFile(service.controlFile,'utf8')),url='http://127.0.0.1:'+control.port;
+  const service=await startRecorderService({root,resourceLeaseDirectory:path.join(root,'test-global-leases'),port:0,connect:async()=>{throw new Error('This test must not connect a browser');},log:()=>{}});t.after(async()=>{await service.shutdown();assert.equal(path.dirname(root),path.resolve(os.tmpdir()));assert.ok(path.basename(root).startsWith('recorder-share-test-'));await fs.rm(root,{recursive:true,force:true});});const control=JSON.parse(await fs.readFile(service.controlFile,'utf8')),url='http://127.0.0.1:'+control.port;
   assert.equal((await fetch(url+'/status')).status,403);
   const headers={'x-recorder-key':control.key};const response=await fetch(url+'/status',{headers});assert.equal(response.status,200);assert.equal((await response.json()).connection,'disconnected');
   assert.equal((await fetch(url+'/command',{method:'POST',headers:{...headers,'Content-Type':'application/json',Origin:'https://example.com'},body:JSON.stringify({action:'probe'})})).status,403);
@@ -142,7 +142,7 @@ test('session methods themselves reject an external runtime junction before read
 });
 test('service refuses an external lock-directory junction without making a lease or controller',async t=>{
   const root=await workspace(t),outside=await workspace(t);await configFile(root);await fs.writeFile(path.join(outside,'sentinel.txt'),'preserve');await junction(root,'data/new-system-browser',outside);
-  await assert.rejects(startRecorderService({root,port:0,connect:async()=>{throw new Error('must not connect');},log:()=>{}}),/项目|目录|链接/u);
+  await assert.rejects(startRecorderService({root,resourceLeaseDirectory:path.join(root,'test-global-leases'),port:0,connect:async()=>{throw new Error('must not connect');},log:()=>{}}),/项目|目录|链接/u);
   assert.deepEqual(await fs.readdir(outside),['sentinel.txt']);assert.equal(await fs.readFile(path.join(outside,'sentinel.txt'),'utf8'),'preserve');
 });
 test('bridge rejects an external adapter-recovery directory before adapter construction',async t=>{

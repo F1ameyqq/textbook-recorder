@@ -1,5 +1,6 @@
 import { activateRecorderPage as activateForegroundPage } from './activate-recorder-page.mjs';
 import { manageRecorderWindow } from './recorder-window-state.mjs';
+import { assertOwnedHeadlessPage } from './owned-headless-browser.mjs';
 
 // The official extension cannot attach a browser-level CDP session. Other
 // protocol failures keep their original stop behavior.
@@ -12,7 +13,7 @@ export function validateBrowserFocusMode(value = 'foreground') {
 }
 
 export function validateBrowserWindowMode(value = 'normal') {
-  if (!['normal', 'minimized'].includes(value)) throw new Error('windowMode 必须是 normal 或 minimized');
+  if (!['normal', 'minimized', 'headless'].includes(value)) throw new Error('windowMode 必须是 normal、minimized 或 headless');
   return value;
 }
 
@@ -39,8 +40,9 @@ export async function readRecorderWindowState(page, guard = async () => {}, { pl
 export async function activateRecorderPage(page, focusMode = 'foreground', { windowMode = 'normal', guard = async () => {}, platform = process.platform, windowController = manageRecorderWindow } = {}) {
   validateBrowserFocusMode(focusMode);
   validateBrowserWindowMode(windowMode);
-  if (focusMode === 'foreground' && windowMode !== 'normal') throw new Error('minimized 只支持 background 模式');
+  if (focusMode === 'foreground' && windowMode !== 'normal') throw new Error('minimized/headless 只支持 background 模式');
   await guard();
+  if (windowMode === 'headless') return assertOwnedHeadlessPage(page);
   if (focusMode === 'foreground') return activateForegroundPage(page, guard);
   if (windowMode === 'normal') return;
   let session;

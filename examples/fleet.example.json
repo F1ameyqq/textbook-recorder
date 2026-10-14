@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "kind": "recorder-fleet",
+  "books": [
+    {
+      "name": "book-a",
+      "root": "D:/TextbookRecorder/books/book-a",
+      "configPath": "config/recorder.json"
+    },
+    {
+      "name": "book-b",
+      "root": "D:/TextbookRecorder/books/book-b",
+      "configPath": "config/recorder.json"
+    }
+  ]
+}

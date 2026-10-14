@@ -8,6 +8,8 @@ import {resolveExtensionAuth} from './extension-auth.mjs';
 import {TASK_ACTIONS,PLATFORM_ORIGIN,validateRecorderConfig,validateRecorderCommand,workspacePath,existingWorkspacePath,existingWorkspaceDirectory,writableWorkspacePath,prepareRuntimeDirectory,recorderBookUrl,assertRecorderPage} from './recorder-config.mjs';
 import {validBeforePlusProof} from './pre-append-recovery.mjs';
 import {validHistoricalNetworkRecoveryProof} from './historical-network-recovery.mjs';
+import {prepareHeadlessProfile} from './recorder-browser-profile.mjs';
+import {validateReadonlyTerminalJob,recorderTerminalDiagnostic} from './recorder-terminal-evidence.mjs';
 
 const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 async function atomic(root,file,value){await writableWorkspacePath(root,file);await prepareRuntimeDirectory(root,path.dirname(file));const temporary=file+'.'+randomUUID()+'.tmp';await writableWorkspacePath(root,temporary);const handle=await fs.open(temporary,'wx');try{await handle.writeFile(JSON.stringify(value,null,2));await handle.sync();}finally{await handle.close();}await writableWorkspacePath(root,file);await fs.rename(temporary,file);}
@@ -19,19 +21,21 @@ const acceptedResume=(proof,generation,bookId,id)=>proof?.schemaVersion===1&&pro
 
 /** One persistent MCP client. Reconnection never resubmits a command. */
 export class PersistentRecorderSession{
-  constructor({root,bookId,focusMode,windowMode,statePath,connect=connectMcp,alive=pidAlive,resolveAuth=resolveExtensionAuth,maxAutomaticReconnects=1,statusTimeoutMs=10000}){
-    const config=validateRecorderConfig({bookId,focusMode,windowMode});this.focusMode=config.focusMode;this.windowMode=config.windowMode;this.root=path.resolve(root);this.bookId=bookId;
+  constructor({root,bookId,focusMode,windowMode,browserBackend,browserProfileDir,accountScope,readOnly,statePath,connect=connectMcp,alive=pidAlive,resolveAuth=resolveExtensionAuth,maxAutomaticReconnects=1,statusTimeoutMs=10000}){
+    const config=validateRecorderConfig({bookId,focusMode,windowMode,browserBackend,browserProfileDir,accountScope,readOnly});this.focusMode=config.focusMode;this.windowMode=config.windowMode;this.root=path.resolve(root);this.bookId=bookId;
+    this.browserBackend=config.browserBackend??'extension';this.browserProfileDir=this.browserBackend==='headless'?workspacePath(this.root,config.browserProfileDir):null;this.accountScope=config.accountScope??null;this.readOnly=config.readOnly??false;
     if(!Number.isSafeInteger(maxAutomaticReconnects)||maxAutomaticReconnects<0||maxAutomaticReconnects>3)throw new Error('自动重连上限必须为 0–3');
     if(!Number.isSafeInteger(statusTimeoutMs)||statusTimeoutMs<1||statusTimeoutMs>45000)throw new Error('状态等待时限必须为 1–45000 毫秒');this.statusTimeoutMs=statusTimeoutMs;
     this.statePath=workspacePath(this.root,statePath??'data/persistent-executor/session.json');this.connectFactory=connect;this.alive=alive;this.resolveAuth=resolveAuth;
     this.connection=null;this.dead=false;this.binding=false;this.pageBindingId=null;this.busy=false;
     this.maxAutomaticReconnects=maxAutomaticReconnects;this.automaticReconnects=0;this.connectionAttempts=0;this.tabCreationAttempted=false;this.ownedTab=null;this.tabCleanup=null;
     this.continuationFence=null;this.pausePersistenceSupported=false;
-    this.state={schemaVersion:1,bookId,pending:null,writeBlocked:false,blockedContext:null,last:null,seenIds:[],connectionCount:0,pauseControl:{schemaVersion:1,generation:0,paused:false}};
+    this.state={schemaVersion:1,bookId,browserBackend:this.browserBackend,browserProfileDir:this.browserProfileDir,readOnly:this.readOnly,pending:null,writeBlocked:false,blockedContext:null,last:null,seenIds:[],connectionCount:0,pauseControl:{schemaVersion:1,generation:0,paused:false}};
   }
   async initialize(){
     this.statePath=await writableWorkspacePath(this.root,this.statePath);
     try{const saved=JSON.parse(await fs.readFile(await existingWorkspacePath(this.root,this.statePath),'utf8')),pending=saved.pending,blocked=saved.blockedContext;
+      if((saved.readOnly??false)!==this.readOnly||(saved.browserBackend??'extension')!==this.browserBackend||this.browserBackend==='headless'&&saved.browserProfileDir!==this.browserProfileDir)throw new Error('原会话 backend/profile 不匹配，禁止迁移或解除写入锁');
       if(saved.schemaVersion!==1||saved.bookId!==this.bookId||typeof saved.writeBlocked!=='boolean'||!Number.isSafeInteger(saved.connectionCount)||saved.connectionCount<0||!Array.isArray(saved.seenIds)||saved.seenIds.some(id=>!validId(id))||new Set(saved.seenIds).size!==saved.seenIds.length||pending!==null&&(!pending||!saved.seenIds.includes(pending.id)||!TASK_ACTIONS.includes(pending.action)||!Number.isSafeInteger(pending.servicePid)||pending.servicePid<1)||saved.writeBlocked&&(!blocked||typeof blocked.manifest!=='string'||typeof blocked.state!=='string'||!/^[a-f0-9]{64}$/u.test(blocked.manifestSha256??'')))throw new Error('会话进度损坏或缺少原任务恢复绑定');
       if(pending)validateRecorderCommand({id:pending.id,action:pending.action,args:pending.args,...(pending.continuationGuard===undefined?{}:{continuationGuard:pending.continuationGuard})},this.root);
       if(blocked){blocked.manifest=await writableWorkspacePath(this.root,blocked.manifest);blocked.state=await writableWorkspacePath(this.root,blocked.state);if(blocked.pendingPath)blocked.pendingPath=await writableWorkspacePath(this.root,blocked.pendingPath);}
@@ -46,7 +50,7 @@ export class PersistentRecorderSession{
     if(!attempt)return this.lastStatusRequest??{state:'idle'};
     return {state:attempt.finished?'settled':attempt.expired?'blocked':'waiting',startedAt:attempt.startedAt,elapsedMs:Math.max(0,Date.now()-attempt.startedMs),dispatched:attempt.dispatched===true,transportReturned:attempt.transportReturned===true,remoteReturned:attempt.remoteReturned===true,responseOutcome:attempt.responseOutcome??null,servicePid:Number.isSafeInteger(attempt.connection?.servicePid)&&attempt.connection.servicePid>0?attempt.connection.servicePid:null,connectionCount:attempt.connectionCount};
   }
-  snapshot(){const blocked=this.state.blockedContext;return {bookId:this.bookId,focusMode:this.focusMode,windowMode:this.windowMode,sessionPath:this.statePath,connection:this.connection&&!this.dead?'connected':'disconnected',authConfigured:this.connection?.authConfigured??null,connectionCount:this.state.connectionCount,statusRequest:this.statusRequestSnapshot(),pauseControl:structuredClone(this.state.pauseControl),continuationFence:this.continuationFence?{...this.continuationFence,pauseGeneration:this.state.pauseControl.generation,paused:this.state.pauseControl.paused}:null,pending:this.state.pending,writeBlocked:this.state.writeBlocked,blockedContext:blocked,last:this.state.last,reconnect:{automaticAttempts:this.automaticReconnects,maximum:this.maxAutomaticReconnects,limited:this.automaticReconnects>=this.maxAutomaticReconnects&&(this.dead||!this.connection)},tabLifecycle:this.state.tabLifecycle??{created:[],lastCleanup:null},tabCleanup:this.tabCleanup,recovery:{required:this.state.writeBlocked,taskId:blocked?.taskId??null,pendingPath:blocked?.pendingPath??null,instruction:this.state.writeBlocked?'先对原 manifest/state/taskId 执行只读 reconcile；未知保存不能重新 execute':'没有待核对保存，可提交新的已审题单'}};}
+  snapshot(){const blocked=this.state.blockedContext;return {bookId:this.bookId,browserBackend:this.browserBackend,browserProfileDir:this.browserProfileDir,accountScope:this.accountScope,readOnly:this.readOnly,readOnlyNetwork:this.readOnlyNetwork??null,focusMode:this.focusMode,windowMode:this.windowMode,sessionPath:this.statePath,connection:this.connection&&!this.dead?'connected':'disconnected',authConfigured:this.connection?.authConfigured??null,connectionCount:this.state.connectionCount,statusRequest:this.statusRequestSnapshot(),pauseControl:structuredClone(this.state.pauseControl),continuationFence:this.continuationFence?{...this.continuationFence,pauseGeneration:this.state.pauseControl.generation,paused:this.state.pauseControl.paused}:null,pending:this.state.pending,writeBlocked:this.state.writeBlocked,blockedContext:blocked,last:this.state.last,reconnect:{automaticAttempts:this.automaticReconnects,maximum:this.maxAutomaticReconnects,limited:this.automaticReconnects>=this.maxAutomaticReconnects&&(this.dead||!this.connection)},tabLifecycle:this.state.tabLifecycle??{created:[],lastCleanup:null},tabCleanup:this.tabCleanup,recovery:{required:this.state.writeBlocked,taskId:blocked?.taskId??null,pendingPath:blocked?.pendingPath??null,instruction:this.state.writeBlocked?'先对原 manifest/state/taskId 执行只读 reconcile；未知保存不能重新 execute':'没有待核对保存，可提交新的已审题单'}};}
   async connect({explicit=false}={}){if(this.closing||this.closed)throw new Error('执行器正在关闭或已关闭');if(this.connectPromise)return this.connectPromise;if(explicit)this.automaticReconnects=0;this.connectPromise=this._connect({explicit}).finally(()=>{this.connectPromise=null;});return this.connectPromise;}
   async _connect({explicit=false}={}){
     if(this.connection&&!this.dead)return;
@@ -54,25 +58,29 @@ export class PersistentRecorderSession{
     this.connectionAttempts++;
     if(this.ownedTab){this.recordTabCleanup({outcome:'retained',reason:'connection-lost',ownerId:this.ownedTab.ownerId});this.ownedTab=null;}
     if(this.connection){await this.connection.close();this.connection=null;this.state.authRequired=true;await this.persist();}
-    if(this.state.authRequired){const auth=await this.resolveAuth();if(!auth.authConfigured)throw new Error('自动重连需要已配置的扩展凭据；不会重复请求浏览器授权');}
+    if(this.state.authRequired&&this.browserBackend==='extension'){const auth=await this.resolveAuth();if(!auth.authConfigured)throw new Error('自动重连需要已配置的扩展凭据；不会重复请求浏览器授权');}
+    if(this.browserBackend==='headless')this.browserProfileDir=await prepareHeadlessProfile({bookId:this.bookId,browserBackend:this.browserBackend,browserProfileDir:this.browserProfileDir,readOnly:this.readOnly},this.root);
     const bridgePath=path.join(path.dirname(this.statePath),'persistent.bridge.cjs'),moduleUrl=pathToFileURL(path.join(this.root,'src/persistent-recorder-bridge.mjs')).href;
     await writableWorkspacePath(this.root,bridgePath);
     this.pageBindingId=randomUUID();
-    const config={root:this.root,bookId:this.bookId,origin:PLATFORM_ORIGIN,inputMode:'browser-command',focusMode:this.focusMode,windowMode:this.windowMode},configUrl=pathToFileURL(path.join(this.root,'src/recorder-config.mjs')).href;
+    const config={root:this.root,bookId:this.bookId,origin:PLATFORM_ORIGIN,inputMode:'browser-command',focusMode:this.focusMode,windowMode:this.windowMode,browserBackend:this.browserBackend,readOnly:this.readOnly,...(this.browserBackend==='headless'?{browserProfileDir:this.browserProfileDir}:{})},configUrl=pathToFileURL(path.join(this.root,'src/recorder-config.mjs')).href;
     // MCP run-code uses a VM without a dynamic-import callback. Keep imports in
     // this CJS init-page closure; the VM invokes only this fixed Node-side loader.
     const bootstrap=`exports.default=async({page})=>{
       const {assertRecorderPage}=await import(${JSON.stringify(configUrl)}),context=page.context(),config=${JSON.stringify(config)},bindingId=${JSON.stringify(this.pageBindingId)};
-      const identity={schemaVersion:1,bookId:config.bookId,focusMode:config.focusMode,windowMode:config.windowMode,bindingId};
+      const ownHeadless=config.browserBackend==='headless'?async target=>{const {establishOwnedHeadlessContext}=await import(${JSON.stringify(pathToFileURL(path.join(this.root,'src/owned-headless-browser.mjs')).href)});await establishOwnedHeadlessContext(target,{profileDir:config.browserProfileDir,bindingId});}:async()=>{};
+      await ownHeadless(page);
+      if(config.readOnly){const {installReadonlyNetworkGuard}=await import(${JSON.stringify(pathToFileURL(path.join(this.root,'src/readonly-network-guard.mjs')).href)});await installReadonlyNetworkGuard(page,{root:config.root,bookId:config.bookId,bindingId});}
+      const identity={schemaVersion:1,bookId:config.bookId,focusMode:config.focusMode,windowMode:config.windowMode,readOnly:config.readOnly,bindingId};
       const matches=()=>context.pages().filter(candidate=>{try{if(candidate.isClosed())return false;assertRecorderPage(candidate.url(),config.bookId);return true;}catch{return false;}});
       const assertTarget=target=>{if(target.context()!==context||target.isClosed())throw new Error('桥接安装目标不属于本连接');assertRecorderPage(target.url(),config.bookId);const pages=matches();if(pages.length!==1||pages[0]!==target)throw new Error('书籍录入页不能唯一确认，拒绝安装');if(target.__textbookRecorderSessionPage!==undefined&&target.__textbookRecorderSessionPage!==bindingId)throw new Error('书页已绑定其他连接，拒绝安装');};
       let loader=context.__textbookRecorderBridgeBootstrap;
       if(loader){if(Object.keys(identity).some(key=>loader[key]!==identity[key])||typeof loader.install!=='function')throw new Error('连接桥接加载器身份不匹配');}
-      else{loader=Object.freeze({...identity,install:async target=>{assertTarget(target);const {installPersistentBridge}=await import(${JSON.stringify(moduleUrl)});assertTarget(target);const bridge=await installPersistentBridge({page:target,config});assertTarget(target);const status=bridge.status();if(status.bookId!==config.bookId||status.focusMode!==config.focusMode||status.windowMode!==config.windowMode)throw new Error('安装桥接的书籍或浏览器模式不匹配');return bridge;}});Object.defineProperty(context,'__textbookRecorderBridgeBootstrap',{value:loader});}
+      else{loader=Object.freeze({...identity,install:async target=>{assertTarget(target);await ownHeadless(target);const {installPersistentBridge}=await import(${JSON.stringify(moduleUrl)});assertTarget(target);const bridge=await installPersistentBridge({page:target,config});assertTarget(target);const status=bridge.status();if(status.bookId!==config.bookId||status.focusMode!==config.focusMode||status.windowMode!==config.windowMode)throw new Error('安装桥接的书籍或浏览器模式不匹配');return bridge;}});Object.defineProperty(context,'__textbookRecorderBridgeBootstrap',{value:loader});}
       if(config.focusMode==='foreground'){try{assertRecorderPage(page.url(),config.bookId);}catch{return;}await loader.install(page);}
     };`;
     await prepareRuntimeDirectory(this.root,path.dirname(bridgePath));await writableWorkspacePath(this.root,bridgePath);await fs.writeFile(bridgePath,bootstrap);
-    const connected=await this.connectFactory(bridgePath);this.connection=connected;this.dead=false;this.binding=false;this.tabCreationAttempted=false;this.continuationFence=null;this.pausePersistenceSupported=false;this.state.authRequired=false;
+    const connected=await this.connectFactory(bridgePath,{browserBackend:this.browserBackend,readOnly:this.readOnly,...(this.browserBackend==='headless'?{browserProfileDir:this.browserProfileDir}:{})});this.connection=connected;this.dead=false;this.binding=false;this.tabCreationAttempted=false;this.continuationFence=null;this.pausePersistenceSupported=false;this.state.authRequired=false;
     connected.onClosed?.(()=>{if(this.connection===connected){this.dead=true;this.binding=false;}});this.state.connectionCount++;await this.persist();validateToolSet((await this.connection.client.listTools()).tools);
   }
   async call(name,args,{onResponse}={}){const connection=this.connection,connectionCount=this.state.connectionCount,bindingId=this.pageBindingId;const result=await connection.client.callTool({name,arguments:args},undefined,{timeout:45000});onResponse?.({connection,connectionCount,bindingId,outcome:result?.isError?'tool-error':'response'});if(result?.isError)throw new Error(safeDiagnosticMessage(result.content?.filter(row=>row.type==='text').map(row=>row.text).join(' ')??'MCP调用失败'));return result;}
@@ -82,13 +90,14 @@ export class PersistentRecorderSession{
   async invokeBridge(action,payload,options){
     if(!['status','syncPause','pause','start','cleanupWindowHelper'].includes(action))throw new Error('桥接动作无效');
     const argument=payload===undefined?'':JSON.stringify(payload),selection=this.focusMode==='background'?this.backgroundPageCode():'',target=this.focusMode==='background'?'target':'page';
-    return parseBridgeResult(await this.call('browser_run_code_unsafe',{code:`async (page) => { ${selection} const identity=${target}.__persistentRecorder?.status(); if(identity?.bookId!==${this.bookId}||identity.focusMode!==${JSON.stringify(this.focusMode)}||identity.windowMode!==${JSON.stringify(this.windowMode)})throw new Error('绑定书页桥接的书籍或 focusMode/windowMode 不匹配'); if (!${target}.__persistentRecorder) throw new Error('常驻桥接未安装'); return await ${target}.__persistentRecorder.${action}(${argument}); }`},options));
+    const result=parseBridgeResult(await this.call('browser_run_code_unsafe',{code:`async (page) => { ${selection} const identity=${target}.__persistentRecorder?.status(); if(identity?.bookId!==${this.bookId}||identity.focusMode!==${JSON.stringify(this.focusMode)}||identity.windowMode!==${JSON.stringify(this.windowMode)}||(identity.readOnly??false)!==${JSON.stringify(this.readOnly)})throw new Error('绑定书页桥接的书籍或 focusMode/windowMode 不匹配'); if (!${target}.__persistentRecorder) throw new Error('常驻桥接未安装'); return await ${target}.__persistentRecorder.${action}(${argument}); }`},options));
+    if(this.readOnly){if(result.readOnly!==true)throw new Error('桥接返回的 readOnly 身份不符');if(result.readOnlyNetwork){if(result.readOnlyNetwork.bindingId!==this.pageBindingId)throw new Error('只读网络证据不属于当前连接');this.readOnlyNetwork=structuredClone(result.readOnlyNetwork);};}return result;
   }
-  bridgeLoaderCode(target){return `const loader=${target}.context().__textbookRecorderBridgeBootstrap; if(loader?.schemaVersion!==1||loader.bookId!==${this.bookId}||loader.focusMode!==${JSON.stringify(this.focusMode)}||loader.windowMode!==${JSON.stringify(this.windowMode)}||loader.bindingId!==${JSON.stringify(this.pageBindingId)}||typeof loader.install!=='function')throw new Error('连接桥接加载器身份不匹配'); await loader.install(${target});`;}
+  bridgeLoaderCode(target){return `const loader=${target}.context().__textbookRecorderBridgeBootstrap; if(loader?.schemaVersion!==1||loader.bookId!==${this.bookId}||loader.focusMode!==${JSON.stringify(this.focusMode)}||loader.windowMode!==${JSON.stringify(this.windowMode)}||(loader.readOnly??false)!==${JSON.stringify(this.readOnly)}||loader.bindingId!==${JSON.stringify(this.pageBindingId)}||typeof loader.install!=='function')throw new Error('连接桥接加载器身份不匹配'); await loader.install(${target});`;}
   async bindBackgroundPage(ownerId){
     const ownership=ownerId===undefined?'':`if(target.url()!==${JSON.stringify(recorderBookUrl(this.bookId))}||target.__textbookRecorderOwnedTab!==undefined)throw new Error('新建书页身份变化，保留页面'); Object.defineProperty(target,'__textbookRecorderOwnedTab',{value:${JSON.stringify(ownerId)}});`;
-    const result=parseBridgeResult(await this.call('browser_run_code_unsafe',{code:`async (page) => { ${this.backgroundPageCode({bound:false})} if(target.__textbookRecorderSessionPage!==undefined&&target.__textbookRecorderSessionPage!==${JSON.stringify(this.pageBindingId)})throw new Error('书页已绑定其他连接，拒绝采用'); if(!target.__persistentRecorder){${this.bridgeLoaderCode('target')}} const identity=target.__persistentRecorder.status(); if(identity.bookId!==${this.bookId}||identity.focusMode!==${JSON.stringify(this.focusMode)}||identity.windowMode!==${JSON.stringify(this.windowMode)})throw new Error('书页桥接的书籍或 focusMode/windowMode 不匹配'); const rechecked=bookPages();if(rechecked.length!==1||rechecked[0]!==target)throw new Error('书页在绑定期间变化，拒绝采用'); if(target.__textbookRecorderSessionPage===undefined)Object.defineProperty(target,'__textbookRecorderSessionPage',{value:${JSON.stringify(this.pageBindingId)}}); ${ownership} return {bookId:${this.bookId},focusMode:${JSON.stringify(this.focusMode)},windowMode:${JSON.stringify(this.windowMode)},bindingId:${JSON.stringify(this.pageBindingId)}${ownerId===undefined?'':`,ownerId:${JSON.stringify(ownerId)}`}}; }`}));
-    if(result.bookId!==this.bookId||result.focusMode!==this.focusMode||result.windowMode!==this.windowMode||result.bindingId!==this.pageBindingId||ownerId!==undefined&&result.ownerId!==ownerId)throw new Error('后台书页绑定未取得本书和模式证明');
+    const result=parseBridgeResult(await this.call('browser_run_code_unsafe',{code:`async (page) => { ${this.backgroundPageCode({bound:false})} if(target.__textbookRecorderSessionPage!==undefined&&target.__textbookRecorderSessionPage!==${JSON.stringify(this.pageBindingId)})throw new Error('书页已绑定其他连接，拒绝采用'); if(!target.__persistentRecorder){${this.bridgeLoaderCode('target')}} const identity=target.__persistentRecorder.status(); if(identity.bookId!==${this.bookId}||identity.focusMode!==${JSON.stringify(this.focusMode)}||identity.windowMode!==${JSON.stringify(this.windowMode)}||(identity.readOnly??false)!==${JSON.stringify(this.readOnly)})throw new Error('书页桥接的书籍或 focusMode/windowMode 不匹配'); const rechecked=bookPages();if(rechecked.length!==1||rechecked[0]!==target)throw new Error('书页在绑定期间变化，拒绝采用'); if(target.__textbookRecorderSessionPage===undefined)Object.defineProperty(target,'__textbookRecorderSessionPage',{value:${JSON.stringify(this.pageBindingId)}}); ${ownership} return {bookId:${this.bookId},readOnly:${JSON.stringify(this.readOnly)},focusMode:${JSON.stringify(this.focusMode)},windowMode:${JSON.stringify(this.windowMode)},bindingId:${JSON.stringify(this.pageBindingId)}${ownerId===undefined?'':`,ownerId:${JSON.stringify(ownerId)}`}}; }`}));
+    if(result.bookId!==this.bookId||(result.readOnly??false)!==this.readOnly||result.focusMode!==this.focusMode||result.windowMode!==this.windowMode||result.bindingId!==this.pageBindingId||ownerId!==undefined&&result.ownerId!==ownerId)throw new Error('后台书页绑定未取得本书和模式证明');
   }
   async installForegroundBridge(){
     const result=parseBridgeResult(await this.call('browser_run_code_unsafe',{code:`async (page) => { const PLATFORM_ORIGIN=${JSON.stringify(PLATFORM_ORIGIN)}; const assertBookPage=${assertRecorderPage.toString()}; assertBookPage(page.url(),${this.bookId}); if(!page.__persistentRecorder){${this.bridgeLoaderCode('page')}} return await page.__persistentRecorder.status(); }`}));
@@ -164,8 +173,29 @@ export class PersistentRecorderSession{
   async localTerminalStatus(message){
     const identity=this.statusIdentity(),pending=identity.pending;
     try{
-      if(pending?.action!=='execute')throw new Error('没有可核对的原新增命令');
+      if(!pending&&['bound-local-terminal','bound-readonly-terminal'].includes(this.state.last?.localTerminalProof?.kind))
+        return {...this.snapshot(),statusSource:'local-terminal',taskNotRetried:true};
+      if(!pending)throw new Error('没有可核对的原命令');
       const jobPath=await existingWorkspacePath(this.root,path.join('data/persistent-executor/jobs',pending.id,'job-result.json')),jobBytes=await fs.readFile(jobPath),job=JSON.parse(jobBytes),result=job.result;
+      if(pending.action!=='execute'){
+        const proof=validateReadonlyTerminalJob(job,pending,{bookId:this.bookId});
+        let reviewed;
+        if(pending.reviewContext){
+          reviewed=await this.reviewedContext(pending.args);const bound=pending.reviewContext;
+          if(reviewed.manifest!==bound.manifest||reviewed.state!==bound.state||reviewed.manifestSha256!==bound.manifestSha256)
+            throw new Error('只读终止证据的原题单或进度绑定已变化');
+        }
+        if(!this.statusIdentityMatches(identity)||sha(await fs.readFile(await existingWorkspacePath(this.root,jobPath)))!==sha(jobBytes)
+          ||reviewed&&sha(await fs.readFile(await existingWorkspacePath(this.root,reviewed.manifest)))!==reviewed.manifestSha256||!this.statusIdentityMatches(identity))
+          throw new Error('只读终止证据或会话身份已变化');
+        this.state.last={...job,localTerminalProof:{...proof,jobPath,jobSha256:sha(jobBytes),
+          ...(reviewed?{manifestPath:reviewed.manifest,statePath:reviewed.state,manifestSha256:reviewed.manifestSha256}:{})},
+          terminalDiagnostic:recorderTerminalDiagnostic(job,{writeBlocked:this.state.writeBlocked,transportBlocked:this.statusOperation?.expired===true})};
+        // Retiring a read-only command proves only termination and never promotes
+        // its recovery result, pause version, continuation fence or transport.
+        this.state.pending=null;await this.persist();
+        return {...this.snapshot(),statusSource:'local-terminal',taskNotRetried:true};
+      }
       const start=Date.parse(job.startedAt),finish=Date.parse(job.finishedAt),submitted=Date.parse(pending.at);
       if(job.id!==pending.id||job.action!==pending.action||job.terminal!==true||job.running!==false||result?.bookId!==this.bookId
         ||job.bookId!==undefined&&job.bookId!==this.bookId||job.servicePid!==undefined&&job.servicePid!==pending.servicePid
@@ -186,7 +216,8 @@ export class PersistentRecorderSession{
       if(!this.statusIdentityMatches(identity)||sha(await fs.readFile(await existingWorkspacePath(this.root,jobPath)))!==terminal.jobSha256
         ||sha(await fs.readFile(await existingWorkspacePath(this.root,context.manifest)))!==context.manifestSha256
         ||sha(await fs.readFile(await existingWorkspacePath(this.root,statePath)))!==sha(stateBytes)||!this.statusIdentityMatches(identity))throw new Error('本地终止证据或会话身份已变化');
-      this.state.last={...job,localTerminalProof:{kind:'bound-local-terminal',jobPath,jobSha256:terminal.jobSha256,manifestSha256:context.manifestSha256,stateSha256:sha(stateBytes)},...(proof?{result:{...result,uncertain:false,noWriteProof:proof}}:{})};
+      this.state.last={...job,localTerminalProof:{kind:'bound-local-terminal',jobPath,jobSha256:terminal.jobSha256,manifestSha256:context.manifestSha256,stateSha256:sha(stateBytes)},...(proof?{result:{...result,uncertain:false,noWriteProof:proof}}:{}),
+        terminalDiagnostic:recorderTerminalDiagnostic(job,{writeBlocked:!proof,transportBlocked:this.statusOperation?.expired===true})};
       this.state.writeBlocked=!proof;this.state.blockedContext=proof?null:{...blocked,taskId:unresolved[0].taskId,pendingPath};this.state.pending=null;await this.persist();
       return {...this.snapshot(),statusSource:'local-terminal',taskNotRetried:true};
     }catch(error){return {...this.snapshot(),error:message,localTerminalError:safeDiagnosticMessage(error.message),taskNotRetried:true};}
@@ -230,8 +261,8 @@ export class PersistentRecorderSession{
     }catch(error){return {...this.snapshot(),error:safeDiagnosticMessage(error.message),taskNotRetried:true};}
   }
   async command(command){
-    if(this.closed||this.closing)throw new Error('执行器正在关闭或已关闭');const {action,args,continuationGuard}=validateRecorderCommand(command,this.root);
-    if(action==='status')return this.status({connect:true});if(action==='pause'){const generation=Math.max(this.state.pauseControl.generation,this.continuationFence?.pauseGeneration??0)+1;if(!Number.isSafeInteger(generation))throw new Error('暂停版本已达上限，保留暂停');this.state.pauseControl={schemaVersion:1,generation,paused:true};await this.persist();const result=await this.bridge('pause',{pauseGeneration:generation});await this.mergePauseFence(result.continuationFence);return {...result,pauseControl:structuredClone(this.state.pauseControl),continuationFence:this.snapshot().continuationFence};}if(action==='close')return this.close();
+    if(this.closed||this.closing)throw new Error('执行器正在关闭或已关闭');const {action,args,continuationGuard}=validateRecorderCommand(command,this.root);if(this.readOnly&&['execute','complete-record-repair'].includes(action))throw new Error('readOnly 服务禁止 execute 和 complete-record-repair，未连接或写入网页');
+    if(action==='status')return this.status({connect:true});if(action==='pause'){const generation=Math.max(this.state.pauseControl.generation,this.continuationFence?.pauseGeneration??0)+1;if(!Number.isSafeInteger(generation))throw new Error('暂停版本已达上限，保留暂停');this.state.pauseControl={schemaVersion:1,generation,paused:true};await this.persist();if(!this.connection&&!this.connectPromise&&!this.bindPromise)return {...this.snapshot(),stopRequested:true,remotePauseConfirmed:false};const result=await this.bridge('pause',{pauseGeneration:generation});await this.mergePauseFence(result.continuationFence);return {...result,...this.snapshot(),remotePauseConfirmed:true};}if(action==='close')return this.close();
     if(this.busy||this.state.pending)throw new Error('已有任务或命令尚未终止');const resumePauseGeneration=action==='execute'&&!continuationGuard?this.state.pauseControl.generation:undefined;this.busy=true;
     try{
       if(this.statusOperation?.expired)throw new Error('原远端状态仍在等待，禁止派发新任务；不重发，不自动重连');
@@ -245,7 +276,7 @@ export class PersistentRecorderSession{
       await this.bind();
       if(continuationGuard){const remote=await this.bridge('status'),fence=await this.mergePauseFence(remote.continuationFence);if(!fence||!this.pausePersistenceSupported)throw new Error('当前浏览器桥接缺少自动接续保护协议，未提交任务');if(fence.paused||fence.previousTerminalId!==continuationGuard.previousTerminalId||fence.pauseGeneration!==continuationGuard.pauseGeneration||continuationGuard.connectionCount!==this.state.connectionCount)throw new Error('自动接续的连接、暂停版本或原终止命令已变化，未提交任务');}
       const previousBlock={writeBlocked:this.state.writeBlocked,blockedContext:structuredClone(this.state.blockedContext)};
-      this.state.pending={id,action,args:structuredClone(args),servicePid:this.connection.servicePid,at:new Date().toISOString(),...(continuationGuard?{continuationGuard:structuredClone(continuationGuard)}:{})};this.state.seenIds.push(id);
+      this.state.pending={id,action,args:structuredClone(args),servicePid:this.connection.servicePid,at:new Date().toISOString(),...(context?{reviewContext:structuredClone(context)}:{}),...(continuationGuard?{continuationGuard:structuredClone(continuationGuard)}:{})};this.state.seenIds.push(id);
       if(action==='execute'){this.state.writeBlocked=true;this.state.blockedContext={...context,taskId:null,pendingPath:null};}await this.persist();
       try{
         const started=await this.bridge('start',{id,action,args,...(continuationGuard?{continuationGuard}:{}),...(resumePauseGeneration===undefined?{}:{resumePauseGeneration})}),fence=await this.mergePauseFence(started.continuationFence);

@@ -13,7 +13,7 @@ import { prepareReviewedLiteralDollarHtml, assertEditorLiteralDollarSafety } fro
 export async function insertReviewedEditorHtml(page, selector, html, { replace = false, timeoutMs = 20000, guard = async () => {}, allowGeneratedTrailingEmptyParagraph = false, focusMode = 'foreground', windowMode = 'normal' } = {}) {
   validateBrowserFocusMode(focusMode);
   validateBrowserWindowMode(windowMode);
-  if (focusMode === 'foreground' && windowMode === 'minimized') throw new Error('minimized 窗口只允许 background 模式');
+  if (focusMode === 'foreground' && windowMode !== 'normal') throw new Error('minimized/headless 只允许 background 模式');
   if (!page || typeof page.locator !== 'function') throw new Error('A Playwright page is required');
   if (typeof selector !== 'string' || !selector.trim()) throw new Error('An explicit editor selector is required');
   if (typeof html !== 'string' || !html.trim() || html.includes('\0')) throw new Error('Reviewed HTML must be nonempty and contain no NUL');
@@ -78,6 +78,7 @@ export async function insertReviewedEditorHtml(page, selector, html, { replace =
     const after = await requireRecorderDocumentReady(page, {focusMode,windowMode,guard});
     assertRecorderDocumentSnapshot(after, backgroundBinding);
     if (String(after.windowId) !== String(backgroundBinding.windowId)) throw new Error('Editor window identity changed during insertion');
+    if (after.browserBindingId !== backgroundBinding.browserBindingId) throw new Error('Editor headless browser identity changed during insertion');
   }
   await assertEditorLiteralDollarSafety(page,selector,literalDollars);
 

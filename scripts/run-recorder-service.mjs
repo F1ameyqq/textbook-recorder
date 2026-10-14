@@ -7,16 +7,21 @@ import {PersistentRecorderSession} from '../src/persistent-recorder-session.mjs'
 import {acquirePersistentLock} from '../src/persistent-recorder-lock.mjs';
 import {loadRecorderConfig,writableWorkspacePath,prepareRuntimeDirectory,existingWorkspacePath} from '../src/recorder-config.mjs';
 import {connectMcp,safeDiagnosticMessage} from './run-new-system-extension.mjs';
+import {acquireRecorderResourceLease} from '../src/recorder-resource-lease.mjs';
+import {prepareHeadlessProfile} from '../src/recorder-browser-profile.mjs';
 
 const defaultRoot=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
-export async function startRecorderService({root=defaultRoot,configPath='config/recorder.json',sessionStatePath='data/persistent-executor/session.json',connect=connectMcp,log=console.log,port}={}){
+export async function startRecorderService({root=defaultRoot,configPath='config/recorder.json',sessionStatePath='data/persistent-executor/session.json',connect=connectMcp,log=console.log,port,resourceLeaseDirectory}={}){
   root=path.resolve(root);const config=await loadRecorderConfig(root,configPath),directory=path.join(root,'data/persistent-executor');
-  const lockPath=path.join(root,'data/new-system-browser/extension-Default.lock');await prepareRuntimeDirectory(root,directory);await prepareRuntimeDirectory(root,path.dirname(lockPath));await writableWorkspacePath(root,lockPath);
+  const lockPath=path.join(root,'data/new-system-browser',config.browserBackend==='headless'?'headless-book-'+config.bookId+'.lock':'extension-Default.lock');await prepareRuntimeDirectory(root,directory);await prepareRuntimeDirectory(root,path.dirname(lockPath));await writableWorkspacePath(root,lockPath);
   const lease=await acquirePersistentLock(lockPath);const key=randomBytes(32).toString('hex');
-  const session=new PersistentRecorderSession({root,bookId:config.bookId,focusMode:config.focusMode,windowMode:config.windowMode,statePath:sessionStatePath,connect:async bridge=>{let connected;await lease.markConnecting();try{connected=await connect(bridge);await lease.updateServicePid(connected.servicePid);return connected;}catch(error){if(error.code==='MCP_EXIT_UNCONFIRMED'&&error.servicePid)await lease.updateServicePid(error.servicePid);else{if(connected)await connected.close();await lease.confirmNoService();}throw error;}}});
-  try{await session.initialize();}catch(error){await lease.release();throw error;}
+  let resourceLease;
+  try{resourceLease=await acquireRecorderResourceLease(config,root,{sessionPath:sessionStatePath,...(resourceLeaseDirectory?{leaseDirectory:resourceLeaseDirectory}:{})});if(config.browserBackend==='headless')config.browserProfileDir=await prepareHeadlessProfile(config,root);}
+  catch(error){await resourceLease?.release();await lease.release();throw error;}
+  const session=new PersistentRecorderSession({root,bookId:config.bookId,focusMode:config.focusMode,windowMode:config.windowMode,browserBackend:config.browserBackend,browserProfileDir:config.browserProfileDir,accountScope:config.accountScope,readOnly:config.readOnly,statePath:sessionStatePath,connect:async (bridge,options)=>{let connected;await lease.markConnecting();await resourceLease.markConnecting();try{connected=await connect(bridge,options);await lease.updateServicePid(connected.servicePid);await resourceLease.updateServicePid(connected.servicePid);return connected;}catch(error){if(error.code==='MCP_EXIT_UNCONFIRMED'&&error.servicePid){await lease.updateServicePid(error.servicePid);await resourceLease.updateServicePid(error.servicePid);}else{if(connected)await connected.close();await lease.confirmNoService();await resourceLease.confirmNoService();}throw error;}}});
+  try{await session.initialize();await session.persist();}catch(error){await resourceLease.release();await lease.release();throw error;}
   let shuttingDown=false,heartbeat;const controlFile=path.join(directory,'control.json');
-  async function shutdown(){if(shuttingDown)return;shuttingDown=true;try{await writableWorkspacePath(root,lockPath);await writableWorkspacePath(root,controlFile);const closed=await session.close();await lease.confirmNoService();await lease.release();clearInterval(heartbeat);await fs.unlink(controlFile).catch(error=>{if(error.code!=='ENOENT')throw error;});server.close();return closed;}catch(error){shuttingDown=false;throw error;}}
+  async function shutdown(){if(shuttingDown)return;shuttingDown=true;try{await writableWorkspacePath(root,lockPath);await writableWorkspacePath(root,controlFile);const closed=await session.close();await lease.confirmNoService();await resourceLease.confirmNoService();const resources=await resourceLease.release();await lease.release();clearInterval(heartbeat);await fs.unlink(controlFile).catch(error=>{if(error.code!=='ENOENT')throw error;});server.close();return {...session.snapshot(),...closed,resourceLease:resources};}catch(error){shuttingDown=false;throw error;}}
   const server=http.createServer(async(request,response)=>{
     const send=(status,value)=>{response.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff'});response.end(JSON.stringify(value));};
     if(request.headers.origin||!/^127\.0\.0\.1:\d+$/u.test(request.headers.host??''))return send(403,{error:'只允许本机命令行控制'});
@@ -28,8 +33,8 @@ export async function startRecorderService({root=defaultRoot,configPath='config/
       return send(200,await session.command(command));
     }catch(error){return send(409,{error:safeDiagnosticMessage(error.message),status:session.snapshot()});}
   });
-  try{await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port??config.port,'127.0.0.1',resolve);});}catch(error){await lease.release();throw error;}
-  const control={schemaVersion:1,bookId:config.bookId,focusMode:session.focusMode,windowMode:session.windowMode,sessionPath:session.statePath,pid:process.pid,port:server.address().port,key};try{await writableWorkspacePath(root,controlFile);await fs.writeFile(controlFile,JSON.stringify(control));}catch(error){server.close();await lease.release();throw error;}
+  try{await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port??config.port,'127.0.0.1',resolve);});}catch(error){await resourceLease.release();await lease.release();throw error;}
+  const control={schemaVersion:1,bookId:config.bookId,browserBackend:session.browserBackend,browserProfileDir:session.browserProfileDir,readOnly:session.readOnly,focusMode:session.focusMode,windowMode:session.windowMode,sessionPath:session.statePath,pid:process.pid,port:server.address().port,key};try{await writableWorkspacePath(root,controlFile);await fs.writeFile(controlFile,JSON.stringify(control));}catch(error){server.close();await resourceLease.release();await lease.release();throw error;}
   heartbeat=setInterval(()=>{if(!shuttingDown&&session.connection&&!session.busy&&session.state.pending)session.status().catch(()=>{});},3000);heartbeat.unref();
   log('常驻执行器已启动：127.0.0.1:'+control.port+'，书 '+config.bookId+'；尚未连接或写入网页。');return {session,server,shutdown,controlFile};
 }

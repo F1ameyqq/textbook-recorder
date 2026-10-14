@@ -14,7 +14,7 @@ import { waitForAppendAutosaveReady, readAppendAutosaveSnapshot } from './append
 import { waitVisibleByTimer } from './timer-visible-wait.mjs';
 import { captureResponseBeforeWait } from './deferred-response-wait.mjs';
 import { activateRecorderPage, validateBrowserFocusMode, validateBrowserWindowMode } from './browser-focus.mjs';
-import { requireRecorderDocumentReady } from './browser-document-state.mjs';
+import { requireRecorderDocumentReady,waitForRecorderDocumentReady } from './browser-document-state.mjs';
 import { existingWorkspacePath, writableWorkspacePath } from './recorder-config.mjs';
 import { validateHistoricalNetworkRecovery, validHistoricalNetworkRecoveryProof } from './historical-network-recovery.mjs';
 
@@ -113,7 +113,8 @@ export class NewSystemAdapter {
     if (!['native-paste', 'browser-command'].includes(inputMode)) throw new Error('inputMode 必须是 native-paste 或 browser-command');
     this.focusMode = validateBrowserFocusMode(focusMode);
     this.windowMode = validateBrowserWindowMode(windowMode);
-    if (this.focusMode === 'foreground' && this.windowMode === 'minimized') throw new Error('minimized 窗口只允许 background 模式');
+    if (this.focusMode === 'foreground' && this.windowMode !== 'normal') throw new Error('minimized/headless 只允许 background 模式');
+    if (this.windowMode === 'headless' && !page) throw new Error('headless 适配器必须使用独立持久服务已绑定的页面');
     if (this.focusMode === 'background' && inputMode !== 'browser-command') throw new Error('后台模式只支持 browser-command；原生剪贴板粘贴须使用 foreground');
     if (!Number.isSafeInteger(directoryTimeout) || directoryTimeout < 1 || directoryTimeout > 120000) throw new Error('directoryTimeout 必须是 1–120000 毫秒的整数');
     if (!Number.isSafeInteger(directoryRootTimeout) || directoryRootTimeout < 1 || directoryRootTimeout > 120000) throw new Error('directoryRootTimeout 必须是 1–120000 毫秒的整数');
@@ -264,16 +265,42 @@ export class NewSystemAdapter {
       const norm = text => String(text ?? '').replace(/\s+/gu, ' ').trim();
       const node = document.querySelector('.el-tree-node.is-current');
       const section = node?.querySelector(':scope > .el-tree-node__content');
-      const parent = node?.parentElement?.closest('.el-tree-node');
-      const chapter = parent?.querySelector(':scope > .el-tree-node__content');
+      const ancestors = [];
+      for (let parent = node?.parentElement?.closest('.el-tree-node'); parent; parent = parent.parentElement?.closest('.el-tree-node')) {
+        ancestors.unshift(norm(parent.querySelector(':scope > .el-tree-node__content')?.innerText));
+      }
       const sectionLabel = norm(section?.innerText);
-      return { chapterLabel: chapter ? norm(chapter.innerText) : sectionLabel, sectionLabel };
+      return { chapterLabel: ancestors.length ? ancestors.join(' > ') : sectionLabel, sectionLabel };
     });
   }
 
   async _scopeMatches(target) {
     const selected = await this._selectedScope();
     return selected.chapterLabel === label(target.chapterLabel) && selected.sectionLabel === label(target.sectionLabel);
+  }
+
+  /** A breadcrumb is a path of separately named nodes, never one DOM label.
+   * Keep flat scope matching compatible; explicit paths start at a tree root
+   * and use immediate children, so repeated middle labels remain isolated. */
+  async _directoryNode(chapterLabel, { budget = () => this.directoryTimeout } = {}) {
+    const parts = String(chapterLabel).split(' > ').map(label);
+    if (!parts.length || parts.length > 8 || parts.some(part => !part)) throw new Error('目录路径为空或超过支持深度');
+    let node, content;
+    for (const [index, part] of parts.entries()) {
+      const candidates = index === 0
+        ? this.page.locator(parts.length === 1 ? '.el-tree-node__content' : '.el-tree > .el-tree-node > .el-tree-node__content')
+        : node.locator(':scope > .el-tree-node__children > .el-tree-node > .el-tree-node__content');
+      content = candidates.filter({hasText:exactLabel(part)});
+      const name = (parts.length === 1 ? '章节 ' : '目录路径 ') + parts.slice(0,index+1).join(' > ');
+      await waitVisibleByTimer(content,{timeout:budget(name,'directory-chapter'),name,targetRole:'directory-chapter'});
+      if (await content.count() !== 1) throw new Error('目录路径标签无法唯一匹配');
+      node = content.locator('xpath=..');
+      if (index < parts.length - 1) {
+        const expanded = await node.evaluate(element => element.classList.contains('is-expanded') || element.getAttribute('aria-expanded') === 'true');
+        if (!expanded) await this._click(content);
+      }
+    }
+    return {node,content};
   }
 
   async _activate() {
@@ -341,6 +368,21 @@ export class NewSystemAdapter {
     // identity first; editor visibility becomes required after scope selection.
     await this.guard({ waitForEditors: false });
     await this._activate();
+    // Reject a hidden or wrongly bound background document before spending the
+    // directory-loading budget. A fresh committed navigation may still load;
+    // readiness and chapter/section waits share the original directory budget.
+    const directoryDeadline=Date.now()+this.directoryTimeout;
+    if(this.focusMode==='background'){
+      try{await waitForRecorderDocumentReady(this.page,{focusMode:this.focusMode,windowMode:this.windowMode,
+        timeoutMs:Math.min(this.timeout,this.directoryTimeout),guard:()=>this.guard({waitForEditors:false})});}
+      catch(error){error.message='目录读取前: '+error.message;throw error;}
+    }
+    const directoryBudget=(name,targetRole)=>{
+      if(this.focusMode!=='background')return this.directoryTimeout;
+      const remaining=directoryDeadline-Date.now();if(remaining>0)return remaining;
+      const error=new Error(name+'在时限内未显示，停止操作');error.code='TARGET_VISIBILITY_TIMEOUT';error.targetRole=targetRole;
+      error.visibilityDiagnostic={name,targetRole,timeout:this.directoryTimeout,budgetExhausted:true,lastState:null};throw error;
+    };
     if (this._directoryKey === scopeKey(target) && await this._scopeMatches(target)) {
       await this._stableList(this._directoryRecords);
       await this.guard();
@@ -353,12 +395,7 @@ export class NewSystemAdapter {
       await this._reloadForFreshRead();
       if (await this._scopeMatches(target)) throw new Error('刷新后目录仍已选中且无可信列表，拒绝等待不存在的列表请求');
     }
-    const chapter = this.page.locator('.el-tree-node__content').filter({ hasText: exactLabel(target.chapterLabel) });
-    // The directory tree itself loads asynchronously after reload. An immediate
-    // count of zero is not evidence that the chapter is absent.
-    await waitVisibleByTimer(chapter,{timeout:this.directoryTimeout,name:'章节 '+target.chapterLabel,targetRole:'directory-chapter'});
-    if (await chapter.count() !== 1) throw new Error('章节标签无法唯一匹配');
-    const chapterNode = chapter.locator('xpath=..');
+    const {node:chapterNode,content:chapter} = await this._directoryNode(target.chapterLabel,{budget:directoryBudget});
     const rootLeaf = label(target.chapterLabel) === label(target.sectionLabel) && await chapterNode.evaluate(node => !node.querySelector(':scope > .el-tree-node__children > .el-tree-node') && Boolean(node.querySelector(':scope > .el-tree-node__content .el-tree-node__expand-icon.is-leaf')));
     const section = rootLeaf ? chapter : chapterNode.locator('.el-tree-node__content').filter({ hasText: exactLabel(target.sectionLabel) });
     const expanded = await chapterNode.evaluate(node => {
@@ -369,7 +406,7 @@ export class NewSystemAdapter {
     // Missing section labels may still be loading inside an already expanded node.
     // Toggle only a visibly collapsed chapter, otherwise wait for the child label.
     if (!rootLeaf && !expanded) await this._click(chapter);
-    await waitVisibleByTimer(section,{timeout:this.directoryTimeout,name:'节目录 '+target.sectionLabel,targetRole:'directory-section'});
+    await waitVisibleByTimer(section,{timeout:directoryBudget('节目录 '+target.sectionLabel,'directory-section'),name:'节目录 '+target.sectionLabel,targetRole:'directory-section'});
     if (await section.count() !== 1) throw new Error('该章节下的节标签无法唯一匹配');
     const cursor = this._sequence;
     const observedList = captureResponseBeforeWait(this.page, {predicate:response => {

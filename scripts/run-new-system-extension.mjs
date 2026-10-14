@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { validateNewSystemManifest, createNewSystemRun } from '../src/new-system-core.mjs';
 import { EXTENSION_TOKEN_ENV, resolveExtensionAuth } from '../src/extension-auth.mjs';
+import { writableWorkspacePath } from '../src/recorder-config.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -231,7 +232,7 @@ export function parseBridgeResult(result) {
   throw new Error('桥接没有返回可验证状态；停止执行，不会自动重跑。');
 }
 
-export async function connectMcp(bridgePath, { authOptions, resolveAuth = resolveExtensionAuth, ClientClass, TransportClass, processAlive = pid => {
+export async function connectMcp(bridgePath, { browserBackend = 'extension', browserProfileDir, readOnly = false, authOptions, resolveAuth = resolveExtensionAuth, ClientClass, TransportClass, processAlive = pid => {
   try { process.kill(pid, 0); return true; } catch (error) { if (error.code === 'ESRCH') return false; throw error; }
 }, closeTimeoutMs = 5000, closePollMs = 50, pause = sleep } = {}) {
   const packagePath = require.resolve('@playwright/mcp/package.json');
@@ -239,9 +240,25 @@ export async function connectMcp(bridgePath, { authOptions, resolveAuth = resolv
   if (metadata.version !== '0.0.83') throw new Error('此入口已验证 @playwright/mcp 0.0.83，请使用项目固定版本。');
   const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
   const { StdioClientTransport } = await import('@modelcontextprotocol/sdk/client/stdio.js');
-  const auth = await resolveAuth(authOptions);
+  if(typeof readOnly!=='boolean'||readOnly&&browserBackend!=='headless')throw new Error('readOnly transport 仅允许独立无头浏览器');
+  if(!['extension','headless'].includes(browserBackend))throw new Error('不支持的 browserBackend');
+  if(browserBackend==='headless'&&(typeof browserProfileDir!=='string'||!path.isAbsolute(browserProfileDir)))throw new Error('headless 必须绑定已规范化的独立 browserProfileDir');
+  const auth = browserBackend==='extension'?await resolveAuth(authOptions):{authConfigured:false,authSource:'owned-profile',childEnv:{}};
   const transportEnv = { ...auth.childEnv };
-  const transport = new (TransportClass ?? StdioClientTransport)({ command:process.execPath, args:[path.join(path.dirname(packagePath), 'cli.js'), '--extension', '--browser', 'msedge', '--profile-dir-name', 'Default', '--init-page', bridgePath, '--snapshot-mode', 'none', '--image-responses', 'omit', '--output-dir', path.dirname(bridgePath)], env:transportEnv, stderr:'pipe' });
+  // Headless launches a new browser process with a book-specific directory. It
+  // never uses --extension, CDP endpoints, the Default profile, or extension auth.
+  let browserArgs;
+  if(browserBackend==='extension')browserArgs=['--extension','--browser','msedge','--profile-dir-name','Default'];
+  else{
+    // MCP's assistant mode omits --enable-automation by default. Add this fixed
+    // switch so CDP can prove the actual launch/profile, rather than trusting a
+    // config assertion. The launch config is local and contains no credentials.
+    const launchConfig=bridgePath+'.headless.json';
+    await writableWorkspacePath(path.dirname(bridgePath),launchConfig);
+    await fs.writeFile(launchConfig,JSON.stringify({browser:{launchOptions:{args:['--enable-automation']}}}));
+    browserArgs=['--headless','--browser','msedge','--user-data-dir',browserProfileDir,'--config',launchConfig,...(readOnly?['--block-service-workers']:[])];
+  }
+  const transport = new (TransportClass ?? StdioClientTransport)({ command:process.execPath, args:[path.join(path.dirname(packagePath), 'cli.js'), ...browserArgs, '--init-page', bridgePath, '--snapshot-mode', 'none', '--image-responses', 'omit', '--output-dir', path.dirname(bridgePath)], env:transportEnv, stderr:'pipe' });
   const client = new (ClientClass ?? Client)({ name:'textbook-recorder-local', version:'1.0.0' });
   let closed = false, servicePid = null, closing;
   const closedListeners = new Set(), priorOnClose = client.onclose;
@@ -272,7 +289,7 @@ export async function connectMcp(bridgePath, { authOptions, resolveAuth = resolv
     await confirmExit();
     let message = String(error?.message ?? '连接失败');
     if (transportEnv[EXTENSION_TOKEN_ENV]) message = message.replaceAll(transportEnv[EXTENSION_TOKEN_ENV], '[令牌省略]');
-    throw new Error(`扩展 MCP 连接失败：${safeDiagnosticMessage(message)}`);
+    throw new Error(`${browserBackend==='headless'?'独立无头':'扩展'} MCP 连接失败：${safeDiagnosticMessage(message)}`);
   } finally { delete transportEnv[EXTENSION_TOKEN_ENV]; }
   transport.stderr?.on('data', () => {});
   const close = () => {
@@ -284,7 +301,7 @@ export async function connectMcp(bridgePath, { authOptions, resolveAuth = resolv
     closedListeners.add(callback);
     if (closed) queueMicrotask(() => { if (closedListeners.delete(callback)) { try { callback(); } catch {} } });
     return () => closedListeners.delete(callback);
-  }, authConfigured:auth.authConfigured, authSource:auth.authSource, profile:{ browser:'msedge', profileDirName:'Default', existingBrowser:true }, close };
+  }, authConfigured:auth.authConfigured, authSource:auth.authSource, profile:browserBackend==='headless'?{browser:'msedge',browserBackend,headless:true,readOnly,userDataDir:browserProfileDir,existingBrowser:false}:{ browser:'msedge', profileDirName:'Default', existingBrowser:true }, close };
 }
 
 export async function main(argv = process.argv.slice(2), { connect = connectMcp, log = console.log, pause = sleep, installSignals = true, browserLockPath = path.join(ROOT, 'data', 'new-system-browser', 'extension-Default.lock') } = {}) {

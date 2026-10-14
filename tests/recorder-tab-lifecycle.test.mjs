@@ -122,7 +122,7 @@ test('a missing result and disconnect preserve command identity without another 
 
 test('custom session paths and authenticated local health reads never create a browser connection',async t=>{
   const root=await workspace(t);await fs.mkdir(path.join(root,'config'));await fs.writeFile(path.join(root,'config/recorder.json'),JSON.stringify({bookId:BOOK}));
-  let connects=0;const statePath='data/jobs/synthetic/original-session.json',service=await startRecorderService({root,sessionStatePath:statePath,port:0,connect:async()=>{connects++;throw new Error('Health must stay local');},log:()=>{}});
+  let connects=0;const statePath='data/jobs/synthetic/original-session.json',service=await startRecorderService({root,resourceLeaseDirectory:path.join(root,'test-global-leases'),sessionStatePath:statePath,port:0,connect:async()=>{connects++;throw new Error('Health must stay local');},log:()=>{}});
   t.after(()=>service.shutdown());const control=JSON.parse(await fs.readFile(service.controlFile,'utf8'));
   assert.equal(control.sessionPath,path.join(root,statePath));const address='http://127.0.0.1:'+control.port;
   assert.equal((await fetch(address+'/health')).status,403);

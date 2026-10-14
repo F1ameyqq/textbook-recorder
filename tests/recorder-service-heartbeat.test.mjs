@@ -9,7 +9,7 @@ test('service heartbeat queries only a connected nonbusy pending command and sto
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'recorder-heartbeat-test-'));
   await fs.mkdir(path.join(root,'config'));await fs.writeFile(path.join(root,'config/recorder.json'),JSON.stringify({bookId:101}));
   t.mock.timers.enable({apis:['setInterval']});
-  const service=await startRecorderService({root,port:0,connect:async()=>{throw new Error('Synthetic heartbeat must not connect a browser');},log:()=>{}}),session=service.session;
+  const service=await startRecorderService({root,resourceLeaseDirectory:path.join(root,'test-global-leases'),port:0,connect:async()=>{throw new Error('Synthetic heartbeat must not connect a browser');},log:()=>{}}),session=service.session;
   t.after(async()=>{session.state.pending=null;await service.shutdown();assert.equal(path.dirname(root),path.resolve(os.tmpdir()));assert.ok(path.basename(root).startsWith('recorder-heartbeat-test-'));await fs.rm(root,{recursive:true,force:true});});
   let remoteCalls=0;const connection={servicePid:60001,close:async()=>{}};session.connection=connection;session.binding=true;session.bind=async()=>{};
   const terminal={id:'synthetic-reader',action:'probe',running:false,terminal:true,result:{bookId:101,writePerformed:false}};

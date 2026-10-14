@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "bookId": 100001,
+  "port": 8791,
+  "origin": "https://easylearn.baidu.com",
+  "browserBackend": "headless",
+  "browserProfileDir": "data/browser-profiles/book-100001",
+  "focusMode": "background",
+  "windowMode": "headless"
+}
