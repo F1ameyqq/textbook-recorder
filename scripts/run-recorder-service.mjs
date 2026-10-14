@@ -30,7 +30,7 @@ export async function startRecorderService({root=defaultRoot,configPath='config/
   });
   try{await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port??config.port,'127.0.0.1',resolve);});}catch(error){await lease.release();throw error;}
   const control={schemaVersion:1,bookId:config.bookId,focusMode:session.focusMode,windowMode:session.windowMode,sessionPath:session.statePath,pid:process.pid,port:server.address().port,key};try{await writableWorkspacePath(root,controlFile);await fs.writeFile(controlFile,JSON.stringify(control));}catch(error){server.close();await lease.release();throw error;}
-  heartbeat=setInterval(()=>{if(!shuttingDown&&session.connection&&!session.busy)session.status().catch(()=>{});},3000);heartbeat.unref();
+  heartbeat=setInterval(()=>{if(!shuttingDown&&session.connection&&!session.busy&&session.state.pending)session.status().catch(()=>{});},3000);heartbeat.unref();
   log('常驻执行器已启动：127.0.0.1:'+control.port+'，书 '+config.bookId+'；尚未连接或写入网页。');return {session,server,shutdown,controlFile};
 }
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)){

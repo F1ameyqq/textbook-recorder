@@ -239,6 +239,30 @@ test('non-authored highlight/span and left/start layout differences do not block
   assert.equal(snapshot(f).ready,true);assert.equal(f.app.saves.length,0);
 });
 
+test('readiness preserves distinct wavy and solid underline when the application model catches up',()=>{
+  const reviewed='<p>甲<u style="text-decoration-style:wavy">乙<sup>①</sup>丙</u><u>丁</u><span style="text-emphasis-style:dot;text-emphasis-position:under">戊</span>。</p>';
+  const f=browserFixture();f.modelChange();f.stem.innerHTML=reviewed;f.model.checkedShitiInfo.question=reviewed;
+  const state=f.run(readAppendAutosaveSnapshot,{...expected,stemHtml:reviewed});
+  assert.equal(state.ready,true);assert.equal(state.fatal.length,0);assert.equal(f.app.saves.length,0);
+});
+
+test('readiness rejects a wavy-to-solid loss in either the DOM or application model',()=>{
+  const wave='<p><u style="text-decoration-style:wavy">甲乙丙</u>。</p>',solid='<p><u>甲乙丙</u>。</p>';
+  for(const [reviewed,dom,model] of [[wave,solid,solid],[wave,wave,solid],[solid,wave,wave],[solid,solid,wave]]){
+    const f=browserFixture();f.modelChange();f.stem.innerHTML=dom;f.model.checkedShitiInfo.question=model;
+    const state=f.run(readAppendAutosaveSnapshot,{...expected,stemHtml:reviewed});
+    assert.equal(state.ready,false);assert.ok(state.differences.length>0);assert.equal(f.app.saves.length,0);
+  }
+});
+
+test('readiness rejects unknown or conflicting authored underline styles before Save',()=>{
+  for(const changed of ['<p><u style="text-decoration-style:dotted">甲</u></p>','<p><u style="text-decoration-style:wavy"><u>甲</u></u></p>']){
+    const f=browserFixture();f.modelChange();f.stem.innerHTML=changed;f.model.checkedShitiInfo.question=changed;
+    const state=f.run(readAppendAutosaveSnapshot,{...expected,stemHtml:changed});
+    assert.equal(state.ready,false);assert.equal(state.fatal.length,1);assert.match(state.fatal[0],/underline style/);assert.equal(f.app.saves.length,0);
+  }
+});
+
 test('no-focus trigger propagates the final pre-Save rejection without activating the button',async()=>{
   const f=browserFixture();f.modelChange();let assertions=0;
   await assert.rejects(checkedPointerClick(f.page,f.page.locator('button.top-btn'),{guard:f.guard,focusMode:'background',windowMode:'minimized',preserveEditorFocus:true,timeout:3000,beforeInput:async()=>{assertions++;f.stem.innerHTML='<p>外部变化</p>';throw new Error('full draft recheck refused');}}),/full draft recheck refused/u);

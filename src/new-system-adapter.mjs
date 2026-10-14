@@ -6,7 +6,9 @@ import { chromium } from 'playwright';
 import { renderEditorHtml, compareNewSystemReadback, verifyNewSystemSave } from './new-system-core.mjs';
 import { writeWindowsClipboardHtml } from './windows-html-clipboard.mjs';
 import { insertReviewedEditorHtml } from './browser-editor-command.mjs';
+import { readEditorLiteralDollarSafety, prepareReviewedLiteralDollarHtml, assertEditorLiteralDollarSafety } from './literal-dollar.mjs';
 import { readEditorNativeEmphasis, assertEditorNativeEmphasis } from './native-emphasis.mjs';
+import { readEditorNativeScripts, assertEditorNativeScripts } from './native-scripts.mjs';
 import { checkedPointerClick } from './checked-pointer-click.mjs';
 import { waitForAppendAutosaveReady, readAppendAutosaveSnapshot } from './append-autosave-readiness.mjs';
 import { waitVisibleByTimer } from './timer-visible-wait.mjs';
@@ -586,7 +588,9 @@ export class NewSystemAdapter {
       };
     });
     const native = await this.page.locator(selector).evaluate(readEditorNativeEmphasis);
-    result.paragraphs.forEach((paragraph,index)=>{paragraph.nativeEmphasis=native[index];});
+    const scripts = await this.page.locator(selector).evaluate(readEditorNativeScripts);
+    result.literalDollarSafety = await this.page.locator(selector).evaluate(readEditorLiteralDollarSafety);
+    result.paragraphs.forEach((paragraph,index)=>{paragraph.nativeEmphasis=native[index];paragraph.nativeScripts=scripts[index];});
     for (const image of result.images) image.sha256 = await this._hashImage(image.src);
     return result;
   }
@@ -847,6 +851,15 @@ export class NewSystemAdapter {
     } catch { throw new Error('正常剪贴板写入预检失败，尚未新增题目'); }
   }
 
+  async _assertLiteralDollarEditors({stemHtml,answerHtml}) {
+    if (this.inputMode !== 'browser-command') return;
+    for (const [selector,html] of [['#contentedit .w-e-text',stemHtml],['#answeredit .w-e-text',answerHtml]]) {
+      if (typeof html !== 'string' || !html.includes('$')) continue;
+      const expected = await this.page.evaluate(prepareReviewedLiteralDollarHtml,html);
+      await assertEditorLiteralDollarSafety(this.page,selector,expected);
+    }
+  }
+
   async _paste(selector, html, { replace = false } = {}) {
     if (this.inputMode === 'browser-command') {
       await this.guard();
@@ -879,6 +892,7 @@ export class NewSystemAdapter {
       return clean(actual.textContent) === clean(expected.textContent) && actual.querySelectorAll('img').length === expected.querySelectorAll('img').length;
     }, { selector, html }, { timeout: this.timeout, polling:80 });
     await assertEditorNativeEmphasis(this.page,selector,html);
+    await assertEditorNativeScripts(this.page,selector,html);
   }
 
   /** Reviewed answer content with the platform's own Add Analysis menu. */
@@ -929,6 +943,7 @@ export class NewSystemAdapter {
       });
     },{selector,html:expected},{timeout:this.timeout,polling:80});
     await assertEditorNativeEmphasis(this.page,selector,expected);
+    await assertEditorNativeScripts(this.page,selector,expected);
     return {analysisButtonClicks:1};
   }
 
@@ -963,7 +978,7 @@ export class NewSystemAdapter {
         edited = true;
         const formatInput=await this._pasteReviewedAnswer(task.answer,{replace:true});
         await checkpoint({phase:'answer-format-input',...formatInput});
-        await this._click(this.page.locator('input.el-input__inner').nth(0));
+        await this._click(this.page.locator('input.el-input__inner').nth(0),{beforeInput:()=>this._assertLiteralDollarEditors({answerHtml:html})});
         phase = 'answer-save-business-receipt';
         const response=await saveResponse.wait();
         if (saves.length !== 1 || saves[0] !== response.request()) throw new Error('答案修正的保存次数与预期不符');
@@ -1088,11 +1103,13 @@ export class NewSystemAdapter {
             const error=new Error('保存按钮点击之前模型、已审内容或页面绑定改变，保留写入锁');
             error.appendModelReadiness={lastSnapshot:snapshot,windowCheck:modelReadiness.windowCheck};throw error;
           }
+          await this._assertLiteralDollarEditors({stemHtml,answerHtml});
+          requireNoEarlierSave();
         }});
         freshPending.saveTrigger=structuredClone(saveTrigger);
       }else{
         phase = 'save-business-receipt';
-        saveTrigger=await this._click(this.page.locator('input.el-input__inner').nth(0));
+        saveTrigger=await this._click(this.page.locator('input.el-input__inner').nth(0),{beforeInput:()=>this._assertLiteralDollarEditors({stemHtml,answerHtml})});
       }
       const response = await saveResponse.wait();
       const requestBody = parsePost(response.request());

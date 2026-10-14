@@ -7,6 +7,7 @@ export function summarizeRecorderStatus(status) {
   if (!object(status)) throw new Error('执行器状态不是对象');
   const summary = fields(status, ['bookId', 'sessionPath', 'focusMode', 'windowMode', 'requestedFocusMode', 'requestedWindowMode', 'connection', 'authConfigured', 'connectionCount', 'reconnectBlocked', 'tabCleanup', 'writeBlocked', 'error', 'taskNotRetried', 'closed', 'started', 'id', 'stopRequested', 'rejected']);
   summary.pending = status.pending ? fields(status.pending, ['id', 'action']) : null;
+  if (status.statusRequest) summary.statusRequest = fields(status.statusRequest, ['state', 'startedAt', 'elapsedMs', 'dispatched', 'transportReturned', 'remoteReturned', 'responseOutcome', 'servicePid', 'connectionCount']);
   if (status.pauseControl) summary.pauseControl = fields(status.pauseControl, ['schemaVersion', 'generation', 'paused']);
   if (status.continuationFence) summary.continuationFence = fields(status.continuationFence, ['schemaVersion', 'previousTerminalId', 'pauseGeneration', 'paused']);
   if (status.reconnect) summary.reconnect = fields(status.reconnect, ['automaticAttempts', 'maximum', 'limited']);

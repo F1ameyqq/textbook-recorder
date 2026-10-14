@@ -30,11 +30,15 @@ export async function requireRecorderDocumentReady(page, { focusMode = 'foregrou
     return { ...before, minimized: false };
   }
   const actual = await windowReader(page, guard);
+  const actualState = actual?.windowState;
   const validId = Number.isSafeInteger(actual?.windowId) && actual.windowId > 0
     || typeof actual?.windowId === 'string' && /^[1-9]\d*$/u.test(actual.windowId);
-  if (!validId || (windowMode === 'minimized' ? actual.windowState !== 'minimized'
-    : !['normal','maximized','fullscreen'].includes(actual.windowState))) throw new Error(windowMode === 'minimized'
-      ? '指定教材页的窗口未保持最小化，停止输入' : '指定教材页没有可确认的正常窗口，停止输入');
+  if (!validId || (windowMode === 'minimized' ? actualState !== 'minimized'
+    : !['normal','maximized','fullscreen'].includes(actualState))) {
+    const state = actualState === undefined ? 'missing' : ['normal','minimized','maximized','fullscreen'].includes(actualState) ? actualState : 'invalid';
+    const prefix = windowMode === 'minimized' ? '指定教材页的窗口未保持最小化，停止输入' : '指定教材页没有可确认的正常窗口，停止输入';
+    throw new Error(`${prefix} (window-proof validId=${validId},state=${state})`);
+  }
   if (windowMode === 'normal' && before.visibilityState !== 'visible') throw new Error('Recorder background document is hidden');
   await guard();
   const after = await page.evaluate(recorderDocumentSnapshot);

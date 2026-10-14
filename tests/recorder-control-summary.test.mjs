@@ -32,6 +32,11 @@ test('pending summary cannot present a previous terminal job as current',()=>{
   assert.deepEqual(summary.pauseControl,{schemaVersion:1,generation:2,paused:true});
 });
 
+test('status request summary exposes lifecycle without private response details',()=>{
+  const summary=summarizeRecorderStatus({...terminal('old'),statusRequest:{state:'blocked',dispatched:true,transportReturned:false,servicePid:123,connectionCount:1,controlKey:'private key',rawResponse:'private response'}});
+  assert.equal(summary.statusRequest.state,'blocked');assert.equal(summary.statusRequest.transportReturned,false);assert.equal(summary.statusRequest.servicePid,123);assert.doesNotMatch(JSON.stringify(summary),/private key|private response|rawResponse|controlKey/u);
+});
+
 test('wait submits one command and polls locally until its own terminal proof',async t=>{
   const root=await workspace(t),commands=[];let id;
   const request=async(_root,command)=>{commands.push(command);if(command.action==='probe'){id=command.id;return {...terminal('old'),pending:{id,action:'probe'}};}return commands.length<4?{...terminal('old'),pending:{id,action:'probe'},remote:{job:{id,action:'probe',running:true,terminal:false}}}:terminal(id);};

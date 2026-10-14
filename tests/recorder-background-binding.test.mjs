@@ -100,7 +100,13 @@ test('background never substitutes an active or replacement tab after bound iden
     if(mode==='replaced'){connection.pages.splice(1,1);connection.current=connection.makePage(recorderBookUrl(BOOK));}
     if(mode==='duplicate-marker')Object.defineProperty(connection.pages[0],'__textbookRecorderSessionPage',{value:book.__textbookRecorderSessionPage});
     if(mode==='foreign-binding'){connection.pages.splice(1,1);const foreign=connection.makePage(recorderBookUrl(BOOK));Object.defineProperty(foreign,'__textbookRecorderSessionPage',{value:'another-connection'});fake.session.binding=false;}
-    const status=await fake.session.status();assert.ok(status.error);assert.equal(book.appends,0);assert.deepEqual(fake.fronts,[]);assert.equal(fake.calls.filter(call=>call.action==='select').length,0);await fake.session.close();
+    const status=await fake.session.status();assert.ok(status.error);assert.equal(book.appends,0);assert.deepEqual(fake.fronts,[]);assert.equal(fake.calls.filter(call=>call.action==='select').length,0);
+    if(mode!=='foreign-binding'){
+      const callsBefore=fake.calls.length;await assert.rejects(fake.session.close(),/原远端状态未确认结束/u);assert.equal(fake.calls.length,callsBefore);assert.deepEqual(fake.closed,[]);
+      await assert.rejects(fake.session.command({action:'execute',args:{manifest:'batch.json'}}),/原远端状态/u);assert.equal(book.appends,0);assert.equal(fake.calls.length,callsBefore);
+      connection.disconnect();assert.equal(fake.session.dead,true);
+    }
+    await fake.session.close();
   });
 });
 
