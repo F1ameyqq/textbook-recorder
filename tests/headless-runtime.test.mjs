@@ -14,6 +14,7 @@ import { startRecorderService } from '../scripts/run-recorder-service.mjs';
 import { EventEmitter } from 'node:events';
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const selectorLabel = 'Starter Unit 2 What\'s this / quoted \u0060 >> English?';
 const temporary = async t => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'recorder-headless-offline-'));
   t.after(async () => { await t.headlessConnection?.close(); await fs.rm(root, { recursive: true, force: true }); });
@@ -30,6 +31,17 @@ test('headless configuration is explicit, isolated, and does not reinterpret ext
     assert.throws(() => validateRecorderConfig({ bookId: 102, ...value }));
   }
   assert.throws(() => assertOwnedHeadlessPage({ context: () => ({}) }), /已证明身份/u);
+});
+
+test('every owned headless MCP launch blocks service workers, including explicit write mode', async t => {
+  const root=await temporary(t),bridge=path.join(root,'fixture.bridge.cjs');await fs.writeFile(bridge,'// offline transport fixture');
+  for(const readOnly of [false,true]){
+    let parameters;
+    const connection=await connectMcp(bridge,{browserBackend:'headless',browserProfileDir:root,readOnly,
+      TransportClass:class{constructor(value){parameters=value;}},ClientClass:class{async connect(){}async close(){}},
+      resolveAuth:()=>{throw new Error('owned headless must not use extension credentials');}});
+    assert.ok(parameters.args.includes('--block-service-workers'));assert.ok(!parameters.args.includes('--extension'));await connection.close();
+  }
 });
 
 test('headless launch config rejects an external directory link before constructing a transport', async t => {
@@ -138,6 +150,7 @@ test('fixed MCP headless transport uses a fresh persistent profile and real chec
   const helper = pathToFileURL(path.join(repository, 'src/owned-headless-browser.mjs')).href;
   const input = pathToFileURL(path.join(repository, 'src/browser-editor-command.mjs')).href;
   const ready = pathToFileURL(path.join(repository, 'src/browser-document-state.mjs')).href;
+  const adapter = pathToFileURL(path.join(repository, 'src/new-system-adapter.mjs')).href;
   await fs.writeFile(bridge, `exports.default=async({page})=>{
     const context=page.context();
     if(!context.__offlineHeadlessFixture){
@@ -145,7 +158,7 @@ test('fixed MCP headless transport uses a fresh persistent profile and real chec
       const {establishOwnedHeadlessContext}=await import(${JSON.stringify(helper)});
       const {insertReviewedEditorHtml}=await import(${JSON.stringify(input)});
       const {requireRecorderDocumentReady}=await import(${JSON.stringify(ready)});
-      context.__offlineHeadlessFixture={requests,bind:target=>establishOwnedHeadlessContext(target,{profileDir:${JSON.stringify(profile)},bindingId:${JSON.stringify(bindingId)}}),insert:target=>insertReviewedEditorHtml(target,'#target','<p>　　已审正文 <sub>2</sub> <sup>3</sup></p>',{focusMode:'background',windowMode:'headless',timeoutMs:5000,guard:async()=>{if(target.url()!=='about:blank')throw new Error('offline-only');}}),ready:target=>requireRecorderDocumentReady(target,{focusMode:'background',windowMode:'headless'})};
+      context.__offlineHeadlessFixture={requests,bind:target=>establishOwnedHeadlessContext(target,{profileDir:${JSON.stringify(profile)},bindingId:${JSON.stringify(bindingId)}}),insert:target=>insertReviewedEditorHtml(target,'#target','<p>　　已审正文 <sub>2</sub> <sup>3</sup></p>',{focusMode:'background',windowMode:'headless',timeoutMs:5000,guard:async()=>{if(target.url()!=='about:blank')throw new Error('offline-only');}}),ready:target=>requireRecorderDocumentReady(target,{focusMode:'background',windowMode:'headless'}),parentLabel:async(target,label)=>{const {NewSystemAdapter}=await import(${JSON.stringify(adapter)});const instance=new NewSystemAdapter({page:target,inputMode:'browser-command',directoryTimeout:5000});const {node}=await instance._directoryNode(label);return node.evaluate(element=>element.dataset.fixture);}};
     }
     await context.__offlineHeadlessFixture.bind(page);
     page.bringToFront=async()=>{throw new Error('offline fixture forbids window activation');};
@@ -159,9 +172,12 @@ test('fixed MCP headless transport uses a fresh persistent profile and real chec
     await page.setContent('<!doctype html><body><div id="target" style="margin:30px;width:600px;min-height:90px;border:1px solid" contenteditable="true"></div><div id="sentinel">unchanged</div></body>');
     const before=await fixture.ready(page),inserted=await fixture.insert(page);
     const savedHtml=await page.locator('#target').innerHTML();
+    const label=${JSON.stringify(selectorLabel)};
+    await page.evaluate(label=>{const node=document.createElement('div');node.className='el-tree-node';node.dataset.fixture='exact-parent';const content=document.createElement('div');content.className='el-tree-node__content';content.textContent=label;node.appendChild(content);document.body.appendChild(node);},label);
+    const selectorParent=await fixture.parentLabel(page,label);
     const rejected=[];await page.locator('#target').evaluate(element=>{element.replaceChildren();const overlay=document.createElement('div');overlay.id='overlay';overlay.style='position:fixed;inset:0;z-index:9999';document.body.appendChild(overlay);});
     try{await fixture.insert(page);}catch(error){rejected.push(error.message);}
-    return {before,inserted,sentinel:await page.locator('#sentinel').textContent(),html:savedHtml,rejected,requests:fixture.requests};
+    return {before,inserted,selectorParent,sentinel:await page.locator('#sentinel').textContent(),html:savedHtml,rejected,requests:fixture.requests};
   }` } }, undefined, { timeout: 45000 });
   if (rawResult.isError) console.error(JSON.stringify(rawResult));
   assert.notEqual(rawResult.isError, true, JSON.stringify(rawResult));
@@ -170,6 +186,7 @@ test('fixed MCP headless transport uses a fresh persistent profile and real chec
   assert.equal(result.before.visibilityState, 'visible');
   assert.equal(result.inserted.succeeded, true);
   assert.equal(result.inserted.selectionVerified, true);
+  assert.equal(result.selectorParent,'exact-parent');
   assert.equal(result.sentinel, 'unchanged');
   assert.match(result.html, /已审正文/u);
   assert.equal(result.rejected.length, 1);

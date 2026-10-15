@@ -11,7 +11,7 @@ import { summarizeRecorderStatus } from '../src/recorder-status-summary.mjs';
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-async function runtimeFixture(t, { attempts = false } = {}) {
+async function runtimeFixture(t, { attempts = false, tree = false } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'readonly-recorder-mcp-offline-'));
   await fs.cp(path.join(repository, 'src'), path.join(root, 'src'), { recursive: true });
   await fs.cp(path.join(repository, 'scripts'), path.join(root, 'scripts'), { recursive: true });
@@ -30,9 +30,13 @@ async function runtimeFixture(t, { attempts = false } = {}) {
     // The fixture lives wholly behind context routes. It cannot reach Baidu or
     // any other network destination. The production read guard is installed
     // after this fallback and therefore has priority over it.
-    const fixture = `if(!context.__offlineReadFixture){context.__offlineReadFixture={passed:[]};await context.route('**/*',async route=>{const request=route.request(),url=new URL(request.url());context.__offlineReadFixture.passed.push({method:request.method(),pathname:url.pathname});if(url.origin==='https://easylearn.baidu.com'&&request.method()==='GET'){await route.fulfill({status:200,contentType:'text/html',body:'<!doctype html><html><body><div id="contentedit"><div class="w-e-text" contenteditable="true"></div></div><div id="answeredit"><div class="w-e-text" contenteditable="true"></div></div><p>offline runtime fixture</p></body></html>'});}else await route.abort('blockedbyclient');});}`;
+    const node=(name,children='',leaf=false)=>'<div class="el-tree-node'+(children?' is-expanded':'')+'"><div class="el-tree-node__content"><i class="el-tree-node__expand-icon'+(leaf?' is-leaf':'')+'"></i>'+name+'</div>'+(children?'<div class="el-tree-node__children">'+children+'</div>':'')+'</div>';
+    const treeNodes=node('Unloaded parent')+node('Root leaf','',true)+node('Unit B',node('Period One',node('基础巩固','',true)));
+    const html='<!doctype html><html><head><meta charset="utf-8"></head><body><div id="contentedit"><div class="w-e-text" contenteditable="true"></div></div><div id="answeredit"><div class="w-e-text" contenteditable="true"></div></div>'+
+      (tree?'<div class="el-tree"></div><script>fetch("/edushop/textbook/detail/basicinfo?textbookID=102");setTimeout(()=>document.querySelector(".el-tree").innerHTML='+JSON.stringify(treeNodes)+',180);</script>':'<p>offline runtime fixture</p>')+'</body></html>';
+    const fixture = `if(!context.__offlineReadFixture){context.__offlineReadFixture={passed:[]};await context.route('**/*',async route=>{const request=route.request(),url=new URL(request.url());context.__offlineReadFixture.passed.push({method:request.method(),pathname:url.pathname});if(url.origin==='https://easylearn.baidu.com'&&request.method()==='GET'){await route.fulfill({status:200,contentType:url.pathname==='/edushop/textbook/detail/basicinfo'?'application/json':'text/html',body:url.pathname==='/edushop/textbook/detail/basicinfo'?JSON.stringify({errno:0,data:{textbookID:102,stateName:'草稿',canEdit:true}}):${JSON.stringify(html)}});}else await route.abort('blockedbyclient');});}`;
     bootstrap = bootstrap.replace('      await ownHeadless(page);', '      ' + fixture + '\n      await ownHeadless(page);');
-    const adapter = `options=>({source:'production',bookId:102,_nodeID:55,_directoryRecords:[],connect:async()=>{},guard:async()=>{},read:async()=>{
+    const adapter = `options=>({source:'production',origin:'https://easylearn.baidu.com',page:options.page,bookId:102,timeout:3000,directoryTimeout:3000,_nodeID:55,_directoryRecords:[],connect:async()=>{},guard:async()=>{},_reloadForFreshRead:async()=>options.page.reload({waitUntil:'domcontentloaded'}),read:async()=>{
       ${attempts ? `await options.page.evaluate(async()=>{for(const method of ['POST','PUT','PATCH','DELETE'])try{await fetch('/edushop/textbook/myproducecommit/editshiti?must-not-log-query=1',{method,body:'must-not-log-body'});}catch{}try{await fetch('/edushop/textbook/myproducecommit/editshiti?must-not-log-query=2');}catch{}});` : ''}
       return {status:'missing'};
     }})`;
@@ -47,7 +51,7 @@ async function runtimeFixture(t, { attempts = false } = {}) {
 }
 
 test('ordinary controller probe proves zero mutation requests through actual readonly MCP bootstrap before navigation', { timeout: 60000 }, async t => {
-  const { root } = await runtimeFixture(t);
+  const { root, service } = await runtimeFixture(t);
   const completed = await waitRecorderCommand(root, { id: 'readonly-zero-probe', action: 'probe', args: { chapterLabel: 'Offline chapter', sectionLabel: 'Offline section' } }, { timeoutMs: 15000, pollMs: 20 });
   assert.equal(completed.error, undefined);
   assert.equal(completed.readOnly, true);
@@ -63,6 +67,12 @@ test('ordinary controller probe proves zero mutation requests through actual rea
   assert.equal(disk.bookId, 102); assert.equal(disk.zeroMutationAttempts, true);
   const summary = summarizeRecorderStatus(completed);
   assert.equal(summary.readOnly, true); assert.ok(summary.job.readOnlyNetwork ?? summary.job.result.readOnlyNetwork);
+  for (const action of ['draft-roundtrip', 'draft-roundtrip-restore']) {
+    await assert.rejects(service.session.invokeBridge('start', { id: 'readonly-denied-' + action, action,
+      args: { manifest: 'data/never-read-plan.json', state: 'data/never-created-journal.json' } }), /readOnly/u);
+  }
+  assert.equal(service.session.state.connectionCount, 1);
+  assert.equal((await service.session.status()).remote.job.id, 'readonly-zero-probe');
 });
 
 test('actual readonly MCP blocks write methods and known mutation GET, with attempts disclosed and no sensitive payload logging', { timeout: 60000 }, async t => {
@@ -77,4 +87,16 @@ test('actual readonly MCP blocks write methods and known mutation GET, with atte
   const diskText = await fs.readFile(proof.evidencePath, 'utf8');
   assert.doesNotMatch(diskText, /must-not-log-query|must-not-log-body|headers|cookie|authorization/iu);
   assert.ok(JSON.parse(diskText).endpoints.every(value => value.pathname === '/edushop/textbook/myproducecommit/editshiti'));
+});
+
+test('actual readonly MCP tree preparation waits for loaded nodes and preserves raw scalar draft diagnostics', { timeout: 60000 }, async t => {
+  const {root}=await runtimeFixture(t,{tree:true});
+  const completed=await waitRecorderCommand(root,{id:'readonly-tree-probe',action:'probe',args:{treeSnapshot:true}},{timeoutMs:15000,pollMs:20});
+  assert.equal(completed.last.error,undefined);const result=completed.last.result;
+  assert.equal(result.writePerformed,false);assert.equal(result.basicinfo.stateName,'草稿');assert.equal(result.basicinfo.canEdit,true);assert.equal(result.basicinfo.canEditType,'boolean');
+  assert.equal(result.roots,3);assert.equal(result.visibleLeaves,2);
+  const snapshot=JSON.parse(await fs.readFile(result.treeSnapshotPath,'utf8'));
+  assert.equal(snapshot.treeNodeCount,5);assert.equal(snapshot.contentCount,5);
+  assert.deepEqual(snapshot.visibleLeaves.map(row=>row.path),[['Root leaf'],['Unit B','Period One','基础巩固']]);
+  assert.equal(completed.last.readOnlyNetwork.zeroMutationAttemptsDuringCommand,true);
 });

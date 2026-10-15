@@ -30,7 +30,7 @@ npm run recorder:login-cookies -- --source-root=已登录只读worker绝对目�
 
 迁移只操作本次自有 profile 的本机 cookie，不访问 Edge Default，不复制整个 profile、localStorage、题单、素材或进度，不导航到平台或请求登录、刷新、保存接口。源包保存在源 worker 的 `data/login-cookies/*.dpapi.json`，由 Windows CurrentUser DPAPI 加密；输出仅包含 cookie 数量、名称、domain、path、加密包哈希和自建 context 的安全计数，不输出 cookie 值。计数覆盖所观察的 context 页面请求，不代表浏览器全部后台流量。
 
-导入后私下关闭并重开目标 profile 核对持久 cookie；会话 cookie 保留原有效期，不改造成永久 cookie。`platformLoginVerified` 仍为 false，真正的平台有效性须在用户允许的书籍范围内通过普通只读 `probe` 验收。加密包可为同一明确源/目标书籍对再次使用，追加 `--reuse-package=源项目内加密包路径`，此时不重新打开源 profile。当前复用入口仅支持只读专用环境；写入运行时的共享登录仍需另行授权与真实验收，不能由本次迁移推导录入权限。
+导入后私下关闭并重开目标 profile 核对持久 cookie；会话 cookie 保留原有效期，不改造成永久 cookie。`platformLoginVerified` 仍为 false，真正的平台有效性须在用户允许的书籍范围内通过普通只读 `probe` 验收。加密包可为同一明确源/目标书籍对再次使用，追加 `--reuse-package=源项目内加密包路径`，此时不重新打开源 profile。用户已授权目标书的修改测试或录入时，可以显式追加 `--allow-write-target` 导入其独立写入 worker；默认仍拒绝写入目标，源仍须为自有只读 worker。迁移不授予录入权限，两端在取得租约后还会重新检查空闲和未知保存状态。
 
 先完成每书正常工作流所要求的准备与单题验收，再启动多书批量任务。多书支持不改变追加范围、缺答规则、哈希批准、未知保存恢复或审核提交权限。
 
@@ -70,6 +70,20 @@ npm run recorder:diagnose -- --job=原命令ID
 新租约无法自动约束尚未接入该机制的旧服务。旧录入结束前，不在新版启动与旧任务相同书号的服务；其他新书也先完成独立 profile 和本书验收，再进行平台并发测试。租约只覆盖同一机器同一操作系统用户，不能替代跨电脑的目录分工。
 
 真实平台验收应逐步进行：先一书单题，再两本不同书各自单题，同时核对独立来源、ID、序号、完整内容、刷新回读和旧记录不变。只有真实验收通过后才能报告线上多书并行和无窗口录入可用。
+
+## 已授权草稿修改往返测试
+
+用户明确授权修改现有草稿题时，可使用专用 `draft-roundtrip`，不适用于普通追加授权。计划种类为 `draft-runtime-roundtrip`，来源为冻结的 `server-snapshot`，绑定用户原话、书号、目录、末题原 ID 及完整目录原始八字段文件的 SHA256。此计划不冒充原图审校题单，也不能用于普通 execute。
+
+固定流程仅在原答案后增加临时标记，通过原生编辑器和失焦正常保存，再恢复原始答案 HTML 并正常保存。每次均先核对新鲜的草稿状态、原 ID、来源、原题干及完整目录，发出请求前拦截内容越界；两次业务回执和刷新全文比对通过后才解锁。仅选择普通段落文字答案，不删除或新建题目。
+
+```powershell
+node scripts/recorder-control.mjs draft-roundtrip data/jobs/本次作业/roundtrip.args.json --wait --details
+```
+
+参数文件仅接受 `manifest` 和 `state` 路径。manifest 是上述冻结计划；state 必须是尚不存在的专用 journal 路径。入口仅支持独立 headless 后台写入 worker；readOnly、扩展模式和重复 journal 均拒绝执行。
+
+失败后保留原进程、计划、基线和 journal，先用同一参数文件执行 `reconcile` 只读核对。只有原进程持续观察到一次已成功且已刷新核对的临时保存、从未开始恢复、连接及 journal 未改变时，`draft-roundtrip-restore` 才能单次恢复原答案。恢复请求已发出但结果未知时禁止再发；跨进程或磁盘上零请求计数不能构成恢复许可。测试成功只证明该次修改保存与恢复，不代表新题追加、删除重建或长期批量任务已经验收。
 
 ## 首轮离线开发验证
 

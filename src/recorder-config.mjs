@@ -5,7 +5,7 @@ import {validateBrowserFocusMode,validateBrowserWindowMode} from './browser-focu
 import {validateRecorderIsolationFields} from './recorder-resource-lease.mjs';
 
 export const PLATFORM_ORIGIN='https://easylearn.baidu.com';
-export const TASK_ACTIONS=['probe','collect','verify','execute','readback','reconcile','complete-record-repair'];
+export const TASK_ACTIONS=['probe','collect','verify','execute','readback','reconcile','complete-record-repair','draft-roundtrip','draft-roundtrip-restore'];
 export const CONTROL_ACTIONS=[...TASK_ACTIONS,'pause','close','status'];
 function withinWorkspace(root,candidate,allowRoot=false){
   const relative=path.relative(root,candidate);
@@ -101,7 +101,7 @@ export function validateRecorderCommand(command,root){
   const {action,args={}}=command;
   if(!CONTROL_ACTIONS.includes(action)||!args||typeof args!=='object'||Array.isArray(args))throw new Error('命令或参数无效');
   let continuationGuard;if(command.continuationGuard!==undefined){if(action!=='execute')throw new Error('continuationGuard 仅允许用于 execute');continuationGuard=validateContinuationGuard(command.continuationGuard);}
-  const allowed=action==='collect'?['from','to','output']:action==='probe'?['chapterLabel','sectionLabel','inventory','exportRecords']:['status','pause','close'].includes(action)?[]:['manifest','state',...(['execute','verify'].includes(action)?['limit']:['taskId']),...(action==='readback'?['capture']:[]),...(['reconcile','complete-record-repair'].includes(action)?['pendingPath']:[])];
+  const allowed=action==='collect'?['from','to','output']:action==='probe'?['chapterLabel','sectionLabel','inventory','exportRecords','treeSnapshot']:['draft-roundtrip','draft-roundtrip-restore'].includes(action)?['manifest','state']:['status','pause','close'].includes(action)?[]:['manifest','state',...(['execute','verify'].includes(action)?['limit']:['taskId']),...(action==='readback'?['capture']:[]),...(['reconcile','complete-record-repair'].includes(action)?['pendingPath']:[])];
   if(action==='complete-record-repair')allowed.push('priorCompletionCommandId');
   if(action==='reconcile')allowed.push('preAppendFailureCommandId','preStemFailureCommandId','baselineProbeCommandId','historicalNetworkEvidencePath');
   if(Object.keys(args).some(key=>!allowed.includes(key)))throw new Error('命令参数无效，不接受专项修复或代码参数');
@@ -112,12 +112,15 @@ export function validateRecorderCommand(command,root){
     if(!Number.isSafeInteger(args.from)||args.from<1||!Number.isSafeInteger(args.to)||args.to<args.from)throw new Error('采集必须明确正整数 from/to 页段');
     if(args.output!==undefined){const full=workspacePath(root,args.output),jobs=workspacePath(root,'data/jobs');if(!/^[A-Za-z0-9_-]{1,80}$/u.test(path.relative(jobs,full)))throw new Error('采集输出必须是 data/jobs/<job> 目录');}
   }else if(action==='probe'){
-    if(args.inventory!==undefined&&typeof args.inventory!=='boolean'||args.exportRecords!==undefined&&typeof args.exportRecords!=='boolean')throw new Error('盘点参数必须为布尔值');
+    if(args.inventory!==undefined&&typeof args.inventory!=='boolean'||args.exportRecords!==undefined&&typeof args.exportRecords!=='boolean'||args.treeSnapshot!==undefined&&typeof args.treeSnapshot!=='boolean')throw new Error('盘点参数必须为布尔值');
     if(Boolean(args.chapterLabel)!==Boolean(args.sectionLabel)||args.chapterLabel!==undefined&&(typeof args.chapterLabel!=='string'||!args.chapterLabel.trim()||typeof args.sectionLabel!=='string'||!args.sectionLabel.trim()))throw new Error('单节盘点需完整章/节名称');
     if(args.inventory&&(args.chapterLabel||args.exportRecords)||args.exportRecords&&!args.sectionLabel)throw new Error('盘点参数冲突');
+    if(args.treeSnapshot&&(args.inventory||args.exportRecords||args.chapterLabel||args.sectionLabel))throw new Error('只读目录树快照不能混用盘点或单节参数');
   }else if(TASK_ACTIONS.includes(action)){
     if(typeof args.manifest!=='string')throw new Error('必须指定已审题单 manifest');
-    if(['readback','reconcile','complete-record-repair'].includes(action)&&(typeof args.taskId!=='string'||!args.taskId))throw new Error('必须指定原题单 taskId');
+    if(['readback','complete-record-repair'].includes(action)&&(typeof args.taskId!=='string'||!args.taskId)
+      ||action==='reconcile'&&(typeof args.taskId!=='string'||!args.taskId)&&(typeof args.state!=='string'||Object.keys(args).some(key=>!['manifest','state'].includes(key))))throw new Error('必须指定原题单 taskId，草稿计划核对只接受 manifest/state');
+    if(['draft-roundtrip','draft-roundtrip-restore'].includes(action)&&(typeof args.state!=='string'||!args.state.trim()||!args.manifest.trim()))throw new Error('草稿往返测试必须指定独立 manifest/state');
     if(action==='complete-record-repair'&&(typeof args.state!=='string'||typeof args.pendingPath!=='string'))throw new Error('补全必须指定原进度和待核对意图');
     if(args.limit!==undefined&&(!Number.isSafeInteger(args.limit)||args.limit<1||args.limit>1000))throw new Error('limit 必须为 1–1000');
     if(args.capture!==undefined&&typeof args.capture!=='boolean')throw new Error('capture 必须为布尔值');

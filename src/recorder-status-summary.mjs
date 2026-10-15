@@ -18,13 +18,13 @@ export function summarizeRecorderStatus(status) {
   if (job) {
     summary.job = fields(job, ['id', 'action', 'running', 'terminal', 'phase', 'phaseTaskId', 'adapterPhase', 'error', 'evidenceError', 'preflightPath', 'stopRequested', 'readOnlyNetwork']);
     if (job.terminalDiagnostic) summary.job.terminalDiagnostic = fields(job.terminalDiagnostic, ['commandId', 'action', 'statusSource', 'phase', 'taskId', 'phaseElapsedMs', 'finishedAt', 'writeBlocked', 'transportBlocked']);
-    if (job.progress) summary.job.progress = fields(job.progress, ['status', 'completed', 'total', 'verifiedReadbacks', 'downloaded', 'skipped', 'requestedPages', 'systemPage', 'paused']);
+    if (job.progress) summary.job.progress = fields(job.progress, ['status', 'completed', 'total', 'verifiedReadbacks', 'downloaded', 'skipped', 'requestedPages', 'systemPage', 'paused', 'observedSaveRequests', 'receipts']);
     if (job.result) {
-      summary.job.result = fields(job.result, ['bookId', 'taskId', 'stateStatus', 'stopReason', 'counts', 'uncertain', 'writePerformed', 'connected', 'recordCount', 'recordId', 'status', 'scopes', 'records', 'downloaded', 'skipped', 'requestedPages', 'paused', 'manifestPath', 'statePath', 'recordsPath', 'inventoryPath', 'indexPath', 'readbackPath', 'readbackEvidence', 'sectionEvidence', 'screenshotPath', 'outputDirectory', 'readOnlyNetwork']);
+      summary.job.result = fields(job.result, ['kind', 'bookId', 'taskId', 'stateStatus', 'stopReason', 'counts', 'uncertain', 'writePerformed', 'connected', 'recordCount', 'recordId', 'status', 'scopes', 'records', 'downloaded', 'skipped', 'requestedPages', 'paused', 'manifestPath', 'manifestSha256', 'statePath', 'recordsPath', 'inventoryPath', 'indexPath', 'readbackPath', 'readbackEvidence', 'sectionEvidence', 'screenshotPath', 'outputDirectory', 'readOnlyNetwork', 'baselineSha256', 'originalRecordId', 'saveRequests', 'restored', 'preservedRecords', 'outcome', 'writeUnlocked', 'treeSnapshotPath', 'basicinfo', 'roots', 'visibleLeaves']);
       // `records` is an inventory count, never the exported records themselves.
       if (typeof summary.job.result.records !== 'number') delete summary.job.result.records;
       if (job.result.comparison) summary.job.result.comparison = fields(job.result.comparison, ['ok', 'errors']);
-      if (job.result.recovery) summary.job.result.recovery = fields(job.result.recovery, ['outcome', 'writeUnlocked', 'taskId', 'bookId', 'recordId', 'evidencePath', 'errors']);
+      if (job.result.recovery) summary.job.result.recovery = fields(job.result.recovery, ['kind', 'outcome', 'writeUnlocked', 'taskId', 'bookId', 'recordId', 'evidencePath', 'errors', 'baselineRestored', 'allSaveRequestsSettled', 'receiptsComplete', 'zeroNativeInputConfirmed', 'liveRestoreEligible']);
       if (job.result.pendingWrite) summary.job.result.pendingWrite = {
         ...fields(job.result.pendingWrite, ['status', 'phase', 'evidencePath']),
         task: fields(job.result.pendingWrite.task, ['id']),

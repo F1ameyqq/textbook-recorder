@@ -26,7 +26,9 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const positive = value => Number.isSafeInteger(Number(value)) && Number(value) > 0;
 const label = value => String(value ?? '').replace(/\s+/gu, ' ').trim();
 const scopeKey = target => JSON.stringify([label(target.chapterLabel), label(target.sectionLabel)]);
-const exactLabel = value => new RegExp(`^\\s*${label(value).split(' ').map(part => part.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')).join('\\s+')}\\s*$`, 'u');
+// Locator selectors parse quotes and >> before the text RegExp. Encode those
+// delimiters as literal regex escapes so appending a parent locator stays exact.
+const exactLabel = value => new RegExp(`^\\s*${label(value).split(' ').map(part => part.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&').replace(/[\/'"`>]/gu, character => '\\x' + character.charCodeAt(0).toString(16).padStart(2,'0'))).join('\\s+')}\\s*$`, 'u');
 
 function safeNumber(value) { return positive(value) ? Number(value) : undefined; }
 function parsePost(request) {

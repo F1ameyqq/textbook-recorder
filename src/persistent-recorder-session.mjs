@@ -9,7 +9,7 @@ import {TASK_ACTIONS,PLATFORM_ORIGIN,validateRecorderConfig,validateRecorderComm
 import {validBeforePlusProof} from './pre-append-recovery.mjs';
 import {validHistoricalNetworkRecoveryProof} from './historical-network-recovery.mjs';
 import {prepareHeadlessProfile} from './recorder-browser-profile.mjs';
-import {validateReadonlyTerminalJob,recorderTerminalDiagnostic} from './recorder-terminal-evidence.mjs';
+import {validateReadonlyTerminalJob,recorderTerminalDiagnostic,recorderCommandFingerprint} from './recorder-terminal-evidence.mjs';
 
 const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
 async function atomic(root,file,value){await writableWorkspacePath(root,file);await prepareRuntimeDirectory(root,path.dirname(file));const temporary=file+'.'+randomUUID()+'.tmp';await writableWorkspacePath(root,temporary);const handle=await fs.open(temporary,'wx');try{await handle.writeFile(JSON.stringify(value,null,2));await handle.sync();}finally{await handle.close();}await writableWorkspacePath(root,file);await fs.rename(temporary,file);}
@@ -151,6 +151,23 @@ export class PersistentRecorderSession{
     context.state=await writableWorkspacePath(this.root,context.state);if(context.state===manifestPath)throw new Error('进度不能覆盖题单');
     return {...context,manifest:manifestPath,manifestSha256:sha(bytes)};
   }
+  async commandContext(args,action){
+    const manifestPath=await existingWorkspacePath(this.root,args.manifest),manifest=JSON.parse(await fs.readFile(manifestPath,'utf8'));
+    if(manifest.kind!=='draft-runtime-roundtrip'){
+      if(['draft-roundtrip','draft-roundtrip-restore'].includes(action))throw new Error('草稿往返动作只接受独立 draft-runtime-roundtrip 计划');
+      if(action==='reconcile'&&!args.taskId)throw new Error('普通题单核对必须指定原 taskId');
+      return this.reviewedContext(args);
+    }
+    if(!['draft-roundtrip','draft-roundtrip-restore','reconcile'].includes(action)||Object.keys(args).some(key=>!['manifest','state'].includes(key))||typeof args.state!=='string')throw new Error('草稿计划仅允许独立往返、受约束恢复或原计划只读核对');
+    const {loadDraftRuntimePlan}=await import('./draft-runtime-roundtrip.mjs'),plan=await loadDraftRuntimePlan(this.root,manifestPath);
+    if(plan.bookId!==this.bookId)throw new Error('草稿计划书籍与专用 worker 不符');
+    const state=await writableWorkspacePath(this.root,args.state);
+    if([plan.manifestPath,plan.baseline.path].includes(state))throw new Error('草稿 journal 不能覆盖计划或原始基线');
+    return {kind:'draft-runtime-roundtrip',manifest:plan.manifestPath,manifestSha256:plan.manifestSha256,state,
+      baselinePath:plan.baseline.path,baselineSha256:plan.baseline.sha256,originalRecordId:plan.target.shitiID};
+  }
+  draftResultBound(result,context){return context?.kind==='draft-runtime-roundtrip'&&result?.kind===context.kind&&result.bookId===this.bookId
+    &&result.manifestPath===context.manifest&&result.manifestSha256===context.manifestSha256&&result.statePath===context.state;}
   async bindUnknownRecovery(){
     const context=this.state.blockedContext;if(!context||context.taskId)return;
     const manifestBytes=await fs.readFile(await existingWorkspacePath(this.root,context.manifest));if(sha(manifestBytes)!==context.manifestSha256)throw new Error('原题单已变化，保留写入锁');
@@ -177,11 +194,22 @@ export class PersistentRecorderSession{
         return {...this.snapshot(),statusSource:'local-terminal',taskNotRetried:true};
       if(!pending)throw new Error('没有可核对的原命令');
       const jobPath=await existingWorkspacePath(this.root,path.join('data/persistent-executor/jobs',pending.id,'job-result.json')),jobBytes=await fs.readFile(jobPath),job=JSON.parse(jobBytes),result=job.result;
+      if(['draft-roundtrip','draft-roundtrip-restore'].includes(pending.action)){
+        const submitted=Date.parse(pending.at),started=Date.parse(job.startedAt),finished=Date.parse(job.finishedAt),context=await this.commandContext(pending.args,pending.action),blocked=this.state.blockedContext;
+        if(job.id!==pending.id||job.action!==pending.action||job.bookId!==this.bookId||job.servicePid!==pending.servicePid||job.running!==false||job.terminal!==true
+          ||job.commandSha256!==recorderCommandFingerprint(pending)||job.evidenceError||![submitted,started,finished].every(Number.isFinite)||started<submitted||finished<started||finished>Date.now()
+          ||blocked?.kind!==context.kind||blocked.manifest!==context.manifest||blocked.manifestSha256!==context.manifestSha256||blocked.state!==context.state
+          ||!this.statusIdentityMatches(identity)||sha(await fs.readFile(jobPath))!==sha(jobBytes))throw new Error('草稿往返本地终止证据未绑定原计划和命令');
+        this.state.last={...job,localTerminalProof:{kind:'bound-draft-terminal',jobPath,jobSha256:sha(jobBytes),manifestSha256:context.manifestSha256},terminalDiagnostic:recorderTerminalDiagnostic(job,{writeBlocked:true,transportBlocked:this.statusOperation?.expired===true})};
+        // A local job proves termination only. Read-only reconciliation must
+        // confirm the original baseline and settled receipts before unlocking.
+        this.state.pending=null;this.state.writeBlocked=true;await this.persist();return {...this.snapshot(),statusSource:'local-terminal',taskNotRetried:true};
+      }
       if(pending.action!=='execute'){
         const proof=validateReadonlyTerminalJob(job,pending,{bookId:this.bookId});
         let reviewed;
         if(pending.reviewContext){
-          reviewed=await this.reviewedContext(pending.args);const bound=pending.reviewContext;
+          reviewed=await this.commandContext(pending.args,pending.action);const bound=pending.reviewContext;
           if(reviewed.manifest!==bound.manifest||reviewed.state!==bound.state||reviewed.manifestSha256!==bound.manifestSha256)
             throw new Error('只读终止证据的原题单或进度绑定已变化');
         }
@@ -243,13 +271,30 @@ export class PersistentRecorderSession{
           const result=remote.job.result;this.state.writeBlocked=result?.uncertain!==false;
           this.state.blockedContext=this.state.writeBlocked?{...this.state.blockedContext,taskId:result?.pendingWrite?.task?.id??this.state.blockedContext?.taskId??null,pendingPath:result?.pendingWrite?.evidencePath??this.state.blockedContext?.pendingPath??null}:null;
         }
+        if(['draft-roundtrip','draft-roundtrip-restore'].includes(pending.action)){
+          const result=remote.job.result,context=await this.commandContext(pending.args,pending.action),blocked=this.state.blockedContext;
+          if(attempt.expired||!this.statusIdentityMatches(attempt))return {...this.snapshot(),taskNotRetried:true};
+          const restored=!remote.job.error&&!remote.job.evidenceError&&this.draftResultBound(result,context)
+            &&blocked?.kind===context.kind&&blocked.manifestSha256===context.manifestSha256&&blocked.state===context.state
+            &&result.uncertain===false&&result.pendingWrite===null&&result.restored===true&&result.stateStatus==='completed'
+            &&result.baselineSha256===context.baselineSha256&&Array.isArray(result.receipts)&&result.receipts.length>=2;
+          this.state.writeBlocked=!restored;this.state.blockedContext=restored?null:{...blocked,pendingPath:context.state};
+        }
         if(['reconcile','complete-record-repair'].includes(pending.action)&&!remote.job.error&&this.state.writeBlocked){const result=remote.job.result,proof=result?.recovery,blocked=this.state.blockedContext;
+          if(blocked.kind==='draft-runtime-roundtrip'){
+            const zeroNativeInput=proof?.zeroNativeInputConfirmed===true&&blocked.servicePid===this.connection.servicePid
+              &&blocked.connectionCount===this.state.connectionCount&&blocked.bindingId===this.pageBindingId;
+            if(pending.action==='reconcile'&&this.draftResultBound(result,blocked)&&result.writePerformed===false&&result.uncertain===false
+              &&proof?.kind===blocked.kind&&proof.bookId===this.bookId&&proof.writeUnlocked===true&&proof.baselineRestored===true
+              &&proof.allSaveRequestsSettled===true&&(proof.receiptsComplete===true||zeroNativeInput)){this.state.writeBlocked=false;this.state.blockedContext=null;}
+          }else{
           const historical=proof?.liveNoSaveRequests===false&&validHistoricalNetworkRecoveryProof(proof.historicalNetworkProof,{bookId:this.bookId,taskId:blocked.taskId,manifestSha256:blocked.manifestSha256})
             &&proof.historicalNetworkProof.originalPendingPath===blocked.pendingPath&&proof.historicalNetworkProof.currentManifest===blocked.manifest&&proof.historicalNetworkProof.currentState===blocked.state
             &&proof.historicalNetworkProof.freshConfirmation.nodeID===proof.nodeID&&JSON.stringify(proof.historicalNetworkProof.freshConfirmation.priorRecordIds)===JSON.stringify(proof.priorRecordIds);
           const contentProof=proof?.outcome==='saved'?proof.priorRecordsUnchanged===true&&proof.targetRecordUnique===true&&proof.fullContentCompared===true&&Number.isSafeInteger(proof.recordId)&&proof.recordId>0:proof?.outcome==='not_saved'&&(proof.liveNoSaveRequests===true||validBeforePlusProof(proof.beforePlusFailure,{bookId:this.bookId,taskId:blocked.taskId,manifestSha256:blocked.manifestSha256})||historical)&&proof.priorRecordsUnchanged===true&&proof.recordId===null;
           const writeScopeValid=pending.action==='complete-record-repair'?typeof result?.writePerformed==='boolean':result?.writePerformed===false;
           if(writeScopeValid&&result?.uncertain===false&&proof?.writeUnlocked===true&&contentProof&&result.manifestPath===blocked.manifest&&result.statePath===blocked.state&&result.taskId===blocked.taskId&&proof.taskId===blocked.taskId&&proof.bookId===this.bookId){this.state.writeBlocked=false;this.state.blockedContext=null;}
+          }
         }
         this.state.pending=null;await this.persist();
       }else if(pending&&!remote.job&&!this.alive(pending.servicePid)&&this.connection.servicePid!==pending.servicePid){
@@ -261,23 +306,37 @@ export class PersistentRecorderSession{
     }catch(error){return {...this.snapshot(),error:safeDiagnosticMessage(error.message),taskNotRetried:true};}
   }
   async command(command){
-    if(this.closed||this.closing)throw new Error('执行器正在关闭或已关闭');const {action,args,continuationGuard}=validateRecorderCommand(command,this.root);if(this.readOnly&&['execute','complete-record-repair'].includes(action))throw new Error('readOnly 服务禁止 execute 和 complete-record-repair，未连接或写入网页');
+    if(this.closed||this.closing)throw new Error('执行器正在关闭或已关闭');const {action,args,continuationGuard}=validateRecorderCommand(command,this.root);if(this.readOnly&&['execute','complete-record-repair','draft-roundtrip','draft-roundtrip-restore'].includes(action))throw new Error('readOnly 服务禁止 execute、complete-record-repair 和草稿往返写动作，未连接或写入网页');
+    if(['draft-roundtrip','draft-roundtrip-restore'].includes(action)&&(this.browserBackend!=='headless'||this.focusMode!=='background'||this.windowMode!=='headless'))throw new Error('draft-roundtrip 只允许专用 headless 后台写入 worker');
     if(action==='status')return this.status({connect:true});if(action==='pause'){const generation=Math.max(this.state.pauseControl.generation,this.continuationFence?.pauseGeneration??0)+1;if(!Number.isSafeInteger(generation))throw new Error('暂停版本已达上限，保留暂停');this.state.pauseControl={schemaVersion:1,generation,paused:true};await this.persist();if(!this.connection&&!this.connectPromise&&!this.bindPromise)return {...this.snapshot(),stopRequested:true,remotePauseConfirmed:false};const result=await this.bridge('pause',{pauseGeneration:generation});await this.mergePauseFence(result.continuationFence);return {...result,...this.snapshot(),remotePauseConfirmed:true};}if(action==='close')return this.close();
-    if(this.busy||this.state.pending)throw new Error('已有任务或命令尚未终止');const resumePauseGeneration=action==='execute'&&!continuationGuard?this.state.pauseControl.generation:undefined;this.busy=true;
+    if(this.busy||this.state.pending)throw new Error('已有任务或命令尚未终止');const resumePauseGeneration=['execute','draft-roundtrip','draft-roundtrip-restore'].includes(action)&&!continuationGuard?this.state.pauseControl.generation:undefined;this.busy=true;
     try{
       if(this.statusOperation?.expired)throw new Error('原远端状态仍在等待，禁止派发新任务；不重发，不自动重连');
-      const context=!['probe','collect'].includes(action)?await this.reviewedContext(args):null;
+      const context=!['probe','collect'].includes(action)?await this.commandContext(args,action):null;
+      if(action==='draft-roundtrip-restore'){
+        const blocked=this.state.blockedContext;
+        if(!this.state.writeBlocked||blocked?.kind!=='draft-runtime-roundtrip'||context.manifest!==blocked.manifest||context.state!==blocked.state||context.manifestSha256!==blocked.manifestSha256
+          ||!this.connection||this.dead||!this.binding||this.connection.servicePid!==blocked.servicePid||this.state.connectionCount!==blocked.connectionCount||this.pageBindingId!==blocked.bindingId)
+          throw new Error('草稿恢复仅允许原计划、原 journal 和连续活连接；重启或重连不能自动恢复写入');
+      }
       if(action==='collect'&&this.state.writeBlocked)throw new Error('保存结果待核对；保留写入锁，禁止切换来源页采集');
-      if(action==='execute'&&this.state.writeBlocked)throw new Error('保存结果待核对；保留写入锁，禁止再次新增');
+      if(['execute','draft-roundtrip'].includes(action)&&this.state.writeBlocked)throw new Error('保存结果待核对；保留写入锁，禁止再次写入');
+      if(action==='draft-roundtrip'){try{await fs.stat(await existingWorkspacePath(this.root,context.state));throw new Error('原草稿 journal 已存在；只能先对原计划只读 reconcile，禁止重放');}catch(error){if(error.code!=='ENOENT')throw error;}}
       if(action==='reconcile'&&args.historicalNetworkEvidencePath&&!this.state.writeBlocked)throw new Error('历史网络核对仅允许原已锁定的未知保存任务');
       if(action==='complete-record-repair'&&!this.state.writeBlocked)throw new Error('补全仅允许原已绑定待核对任务');
-      if(['reconcile','complete-record-repair'].includes(action)&&this.state.writeBlocked){await this.bindUnknownRecovery();const blocked=this.state.blockedContext,pendingPath=blocked.pendingPath?await writableWorkspacePath(this.root,args.pendingPath??blocked.pendingPath):null;if(context.manifest!==blocked.manifest||context.state!==blocked.state||context.manifestSha256!==blocked.manifestSha256||args.taskId!==blocked.taskId||blocked.pendingPath&&pendingPath!==blocked.pendingPath)throw new Error('只能核对原失败题单/进度/任务');if(blocked.pendingPath)args.pendingPath=pendingPath;}
+      if(['reconcile','complete-record-repair'].includes(action)&&this.state.writeBlocked){
+        const blocked=this.state.blockedContext;
+        if(blocked.kind==='draft-runtime-roundtrip'){
+          if(action!=='reconcile'||context.kind!==blocked.kind||context.manifest!==blocked.manifest||context.state!==blocked.state||context.manifestSha256!==blocked.manifestSha256)throw new Error('只能只读核对原草稿计划和 journal');
+        }else{await this.bindUnknownRecovery();const pendingPath=blocked.pendingPath?await writableWorkspacePath(this.root,args.pendingPath??blocked.pendingPath):null;if(context.manifest!==blocked.manifest||context.state!==blocked.state||context.manifestSha256!==blocked.manifestSha256||args.taskId!==blocked.taskId||blocked.pendingPath&&pendingPath!==blocked.pendingPath)throw new Error('只能核对原失败题单/进度/任务');if(blocked.pendingPath)args.pendingPath=pendingPath;}
+      }
       const id=command.id??randomUUID();if(this.state.seenIds.includes(id))throw new Error('命令 ID 已使用，禁止重复派发');
       await this.bind();
       if(continuationGuard){const remote=await this.bridge('status'),fence=await this.mergePauseFence(remote.continuationFence);if(!fence||!this.pausePersistenceSupported)throw new Error('当前浏览器桥接缺少自动接续保护协议，未提交任务');if(fence.paused||fence.previousTerminalId!==continuationGuard.previousTerminalId||fence.pauseGeneration!==continuationGuard.pauseGeneration||continuationGuard.connectionCount!==this.state.connectionCount)throw new Error('自动接续的连接、暂停版本或原终止命令已变化，未提交任务');}
       const previousBlock={writeBlocked:this.state.writeBlocked,blockedContext:structuredClone(this.state.blockedContext)};
       this.state.pending={id,action,args:structuredClone(args),servicePid:this.connection.servicePid,at:new Date().toISOString(),...(context?{reviewContext:structuredClone(context)}:{}),...(continuationGuard?{continuationGuard:structuredClone(continuationGuard)}:{})};this.state.seenIds.push(id);
-      if(action==='execute'){this.state.writeBlocked=true;this.state.blockedContext={...context,taskId:null,pendingPath:null};}await this.persist();
+      if(['execute','draft-roundtrip','draft-roundtrip-restore'].includes(action)){this.state.writeBlocked=true;this.state.blockedContext={...context,taskId:null,pendingPath:action==='execute'?null:context.state,
+        ...(action==='execute'?{}:{servicePid:this.connection.servicePid,connectionCount:this.state.connectionCount,bindingId:this.pageBindingId})};}await this.persist();
       try{
         const started=await this.bridge('start',{id,action,args,...(continuationGuard?{continuationGuard}:{}),...(resumePauseGeneration===undefined?{}:{resumePauseGeneration})}),fence=await this.mergePauseFence(started.continuationFence);
         if(started.id===id&&started.started===false&&['continuation-fence','pause-fence','status-inflight'].includes(started.rejected)&&started.writePerformed===false&&started.uncertain===false&&fence){this.state.pending=null;this.state.writeBlocked=previousBlock.writeBlocked;this.state.blockedContext=previousBlock.blockedContext;this.state.lastError='执行保护拒绝了任务；连接、暂停或原终止状态已变化，任务未启动';await this.persist();return {...this.snapshot(),error:this.state.lastError,rejected:started.rejected,taskNotRetried:true};}

@@ -69,7 +69,7 @@ async function requireIdle(root,config) {
   try {
     const state=JSON.parse(await fs.readFile(await existingWorkspacePath(root,'data/persistent-executor/session.json'),'utf8'));
     if(state.schemaVersion!==1||state.bookId!==config.bookId||state.pending!==null||state.writeBlocked!==false||state.blockedContext!==null
-      ||state.browserBackend!=='headless'||state.browserProfileDir!==config.browserProfileDir||state.readOnly!==true)throw failure();
+      ||state.browserBackend!=='headless'||state.browserProfileDir!==config.browserProfileDir||(state.readOnly??false)!==(config.readOnly??false))throw failure();
   } catch(error) { if(error.code!=='ENOENT')throw failure(); }
 }
 
@@ -78,6 +78,7 @@ async function withOwnedAuthenticationProfile(root,config,operation,{launch,acqu
   const lease=await acquireLease(config,root,{...(leaseDirectory?{leaseDirectory}:{})});
   let context,launched=false,closed=false;
   try {
+    await requireIdle(root,config);
     const profile=await prepareHeadlessProfile(config,root);
     await lease.markConnecting();launched=true;
     context=await launch(profile,{channel:'msedge',headless:true,serviceWorkers:'block',args:[
@@ -111,20 +112,22 @@ async function withOwnedAuthenticationProfile(root,config,operation,{launch,acqu
   }
 }
 
-/** Both roots must be explicitly owned read-only headless workers. No browser
- * navigation, Default profile, localStorage, source material, or run state is copied. */
+/** Source must be an owned read-only headless worker. A different-book write
+ * target requires explicit opt-in and keeps its real profile/session identity.
+ * No browser navigation, Default profile, localStorage or run state is copied. */
 export async function migrateOwnedSiteLoginCookies({ sourceRoot,targetRoot,
   launch=(profile,options)=>chromium.launchPersistentContext(profile,options),acquireLease=acquireRecorderResourceLease,
-  protect=text=>transformLoginCookiesDpapi(text),unprotect=text=>transformLoginCookiesDpapi(text,{decrypt:true}),leaseDirectory,reusePackage }={}) {
+  protect=text=>transformLoginCookiesDpapi(text),unprotect=text=>transformLoginCookiesDpapi(text,{decrypt:true}),leaseDirectory,reusePackage,allowWriteTarget=false }={}) {
   let payload,cookies;
   try {
-    if(typeof sourceRoot!=='string'||typeof targetRoot!=='string')throw failure();
+    if(typeof sourceRoot!=='string'||typeof targetRoot!=='string'||typeof allowWriteTarget!=='boolean')throw failure();
     sourceRoot=await fs.realpath(sourceRoot);targetRoot=await fs.realpath(targetRoot);
     const source=await loadRecorderConfig(sourceRoot),target=await loadRecorderConfig(targetRoot);
     if(sourceRoot===targetRoot||source.bookId===target.bookId||source.browserBackend!=='headless'||target.browserBackend!=='headless'
-        ||source.readOnly!==true||target.readOnly!==true||source.browserProfileDir===target.browserProfileDir)throw failure();
+        ||source.readOnly!==true||target.readOnly!==true&&!allowWriteTarget||source.browserProfileDir===target.browserProfileDir)throw failure();
     // Export only an already-registered source profile, never adopt a browser.
     await existingWorkspacePath(sourceRoot,path.join(source.browserProfileDir,'.recorder-profile.json'));
+    await prepareHeadlessProfile(source,sourceRoot);
     await requireIdle(sourceRoot,source);await requireIdle(targetRoot,target);
     let sourceAudit=null,packagePath,bytes,ciphertext;
     if(reusePackage!==undefined){
@@ -165,7 +168,8 @@ export async function migrateOwnedSiteLoginCookies({ sourceRoot,targetRoot,
           &&value.value===cookie.value&&value.expires===cookie.expires&&(value.partitionKey??null)===(cookie.partitionKey??null))))throw failure();
     },{launch,acquireLease,leaseDirectory});
     const metadata={origin:PLATFORM_ORIGIN,sourceBookId:source.bookId,targetBookId:target.bookId,cookieCount:selected.length,cookies:selected.map(({name,domain,path})=>({name,domain,path}))};
-    return {...metadata,packagePath,encryptedPackageSha256:sha(bytes),reusedEncryptedPackage:reusePackage!==undefined,importedCookieCount:selected.length,
+    return {...metadata,sourceReadOnly:true,targetReadOnly:target.readOnly===true,writeTargetExplicitlyAllowed:allowWriteTarget,
+      packagePath,encryptedPackageSha256:sha(bytes),reusedEncryptedPackage:reusePackage!==undefined,importedCookieCount:selected.length,
       persistentCookieCount:persistent.length,sessionCookieCount:selected.length-persistent.length,localCookieReadbackVerified:true,persistentCookieReadbackVerified:true,
       sourceAudit,targetAudit:targetOperation.audit,targetPersistenceAudit:persisted.audit,platformLoginVerified:false};
   } catch { throw failure(); }

@@ -12,6 +12,7 @@ import { establishOwnedHeadlessContext } from '../src/owned-headless-browser.mjs
 
 const listPath = '/edushop/textbook/detail/shitilist';
 const middle = 'Period One Listening and Speaking & Reading and Thinking';
+const delimiterRoot = 'Unit B / What\'s "new" ` >> 1';
 const target = { chapterLabel: 'Unit B > ' + middle, sectionLabel: '基础巩固', record: 1, expectedRecordId: 2201 };
 const executable = () => [chromium.executablePath(),
   path.join(process.env['ProgramFiles(x86)'] ?? 'C:/Program Files (x86)', 'Microsoft/Edge/Application/msedge.exe'),
@@ -30,7 +31,7 @@ function treeHtml(mode) {
     'body{margin:24px;font:16px sans-serif}.el-tree{width:560px}.el-tree-node__content{padding:8px;min-height:22px;cursor:pointer}' +
     '.el-tree-node__children{display:none;padding-left:24px}.el-tree-node.is-expanded>.el-tree-node__children{display:block}' +
     '.is-current>.el-tree-node__content{background:#dcecff}.editors{display:none}.w-e-text{min-height:32px;padding:12px}' +
-    '</style></head><body><div class="el-tree">' + node('a-root', 'Unit A', middleNode('a-middle')) + node('b-root', 'Unit B', bChildren) +
+    '</style></head><body><div class="el-tree">' + node('a-root', 'Unit A', middleNode('a-middle')) + node('b-root', mode==='selector-delimiters'?delimiterRoot:'Unit B', bChildren) +
     (mode === 'duplicate-root' ? node('b-root-duplicate', 'Unit B', middleNode('b-middle-other')) : '') +
     '</div><div class="shiti-cont"></div><div class="editors"><div id="contentedit"><div class="w-e-text" contenteditable="true"></div></div>' +
     '<div id="answeredit"><div class="w-e-text" contenteditable="true"></div></div></div><script>' +
@@ -108,6 +109,13 @@ test('real localhost tree isolates breadcrumb paths and keeps original visibilit
     assert.deepEqual(f.lists().map(row => row.nodeID), ['220']);
     assert.equal(await f.page.evaluate(() => window.untrustedClicks), 0);
     await adapter.directory({ target }); assert.equal(f.lists().length, 1, 'full-path cache identity must not cause another LIST');
+  });
+  await t.test('literal slash, quotes, backticks and selector separators survive a chained parent locator', async () => {
+    const adapter=await f.open('selector-delimiters'),scoped={...target,chapterLabel:delimiterRoot+' > '+middle};
+    const records=await adapter.list({target:scoped});assert.equal(records[0].recordId,2201);
+    assert.deepEqual(await f.clicks(),['b-root','b-middle','220']);assert.equal(await adapter._scopeMatches(scoped),true);
+    assert.equal(await adapter._scopeMatches({...scoped,chapterLabel:'Unit B > '+middle}),false);
+    assert.deepEqual(f.lists().map(row=>row.nodeID),['220']);
   });
   for (const [mode, clicks] of [['duplicate-root', []], ['duplicate-middle', ['b-root']], ['duplicate-leaf', ['b-root', 'b-middle']]]) {
     await t.test(mode + ' is rejected before any leaf/list action', async () => {

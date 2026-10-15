@@ -256,7 +256,7 @@ export async function connectMcp(bridgePath, { browserBackend = 'extension', bro
     const launchConfig=bridgePath+'.headless.json';
     await writableWorkspacePath(path.dirname(bridgePath),launchConfig);
     await fs.writeFile(launchConfig,JSON.stringify({browser:{launchOptions:{args:['--enable-automation']}}}));
-    browserArgs=['--headless','--browser','msedge','--user-data-dir',browserProfileDir,'--config',launchConfig,...(readOnly?['--block-service-workers']:[])];
+    browserArgs=['--headless','--browser','msedge','--user-data-dir',browserProfileDir,'--config',launchConfig,'--block-service-workers'];
   }
   const transport = new (TransportClass ?? StdioClientTransport)({ command:process.execPath, args:[path.join(path.dirname(packagePath), 'cli.js'), ...browserArgs, '--init-page', bridgePath, '--snapshot-mode', 'none', '--image-responses', 'omit', '--output-dir', path.dirname(bridgePath)], env:transportEnv, stderr:'pipe' });
   const client = new (ClientClass ?? Client)({ name:'textbook-recorder-local', version:'1.0.0' });

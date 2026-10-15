@@ -8,20 +8,21 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { migrateOwnedSiteLoginCookies, validateSiteCookies, transformLoginCookiesDpapi, LOGIN_COOKIE_DPAPI_ENTROPY } from '../src/login-cookie-migration.mjs';
 import { prepareHeadlessProfile } from '../src/recorder-browser-profile.mjs';
-import { validateRecorderConfig } from '../src/recorder-config.mjs';
+import { validateRecorderConfig, loadRecorderConfig } from '../src/recorder-config.mjs';
+import { main as loginCookiesMain } from '../scripts/recorder-login-cookies.mjs';
 import { chromium } from 'playwright';
 
 const dummyValue = 'synthetic-test-only-cookie-value';
 const cookie = overrides => ({ name: 'fixture_session', value: dummyValue, domain: '.baidu.com', path: '/', expires: Date.now()/1000+3600,
   httpOnly: true, secure: true, sameSite: 'None', ...overrides });
 
-async function workers(t) {
+async function workers(t, { sourceReadOnly = true, targetReadOnly = true, targetBookId = 102 } = {}) {
   const base = await fs.mkdtemp(path.join(os.tmpdir(), 'cookie-migration-offline-'));
   t.after(() => fs.rm(base, { recursive: true, force: true }));
   const roots = [path.join(base,'source'),path.join(base,'target')];
   for (let index=0;index<roots.length;index++) {
     await fs.mkdir(path.join(roots[index],'config'),{recursive:true});
-    const config = validateRecorderConfig({bookId:101+index,browserBackend:'headless',readOnly:true});
+    const config = validateRecorderConfig({bookId:index===0?101:targetBookId,browserBackend:'headless',readOnly:index===0?sourceReadOnly:targetReadOnly});
     await fs.writeFile(path.join(roots[index],'config/recorder.json'),JSON.stringify(config));
     await prepareHeadlessProfile(config,roots[index]);
   }
@@ -45,7 +46,7 @@ function dependencies({ sourceCookies = [cookie()], changeTargetReadback = false
     return context;
   };
   const acquireLease=async(config,root)=>{
-    calls.push({type:'lease',bookId:config.bookId,root});
+    calls.push({type:'lease',bookId:config.bookId,readOnly:config.readOnly??false,root});
     if(leaseFails)throw new Error('a live owned service still holds this resource');
     return {markConnecting:async()=>{},updateServicePid:async pid=>calls.push({type:'pid',pid}),confirmNoService:async()=>{},release:async()=>({released:true})};
   };
@@ -103,6 +104,71 @@ test('an existing encrypted package can be reused for the same explicit pair wit
   assert.ok(second.calls.filter(value=>value.type==='launch').every(value=>value.profile.startsWith(roots.targetRoot)));
 });
 
+test('write target requires a typed explicit opt-in and retains its own real profile and idle session identity',async t=>{
+  const roots=await workers(t,{targetReadOnly:false}),config=await loadRecorderConfig(roots.targetRoot);
+  const marker=path.join(config.browserProfileDir,'.recorder-profile.json'),before=await fs.readFile(marker);
+  await fs.mkdir(path.join(roots.targetRoot,'data/persistent-executor'),{recursive:true});
+  await fs.writeFile(path.join(roots.targetRoot,'data/persistent-executor/session.json'),JSON.stringify({schemaVersion:1,bookId:config.bookId,
+    browserBackend:'headless',browserProfileDir:config.browserProfileDir,readOnly:false,pending:null,writeBlocked:false,blockedContext:null}));
+  for(const allowWriteTarget of [undefined,false,'true',1]){
+    const options=dependencies();
+    await assert.rejects(migrateOwnedSiteLoginCookies({...roots,...options,allowWriteTarget}));
+    assert.equal(options.calls.length,0);
+  }
+  const options=dependencies(),result=await migrateOwnedSiteLoginCookies({...roots,...options,allowWriteTarget:true});
+  assert.equal(result.sourceReadOnly,true);assert.equal(result.targetReadOnly,false);assert.equal(result.writeTargetExplicitlyAllowed,true);
+  assert.deepEqual(options.calls.filter(value=>value.type==='lease').map(value=>value.readOnly),[true,false,false]);
+  assert.deepEqual(await fs.readFile(marker),before);assert.equal(JSON.parse(before).readOnly,undefined);
+  assert.equal(result.platformLoginVerified,false);assert.doesNotMatch(JSON.stringify(result),/synthetic-test-only-cookie-value/u);
+  for(const audit of [result.sourceAudit,result.targetAudit,result.targetPersistenceAudit]){
+    assert.equal(audit.pageNavigationCount,0);assert.equal(audit.pageRequestCount,0);assert.equal(audit.blockedPageRequestCount,0);
+    assert.equal(audit.browserClosed,true);assert.equal(audit.servicePidExitConfirmed,true);
+  }
+});
+
+test('write opt-in cannot adopt a read-only marker, a write source, the same book, or a mismatched session',async t=>{
+  for(const mode of ['read-only-marker','write-source','same-book','read-only-session','pending-session'])await t.test(mode,async child=>{
+    const roots=await workers(child,{sourceReadOnly:mode!=='write-source',targetReadOnly:mode==='read-only-marker',targetBookId:mode==='same-book'?101:102});
+    if(mode==='read-only-marker')await fs.writeFile(path.join(roots.targetRoot,'config/recorder.json'),JSON.stringify({bookId:102,browserBackend:'headless',readOnly:false}));
+    const config=await loadRecorderConfig(roots.targetRoot),marker=path.join(config.browserProfileDir,'.recorder-profile.json'),before=await fs.readFile(marker);
+    if(mode.endsWith('session')){
+      await fs.mkdir(path.join(roots.targetRoot,'data/persistent-executor'),{recursive:true});
+      await fs.writeFile(path.join(roots.targetRoot,'data/persistent-executor/session.json'),JSON.stringify({schemaVersion:1,bookId:config.bookId,
+        browserBackend:'headless',browserProfileDir:config.browserProfileDir,readOnly:mode==='read-only-session',pending:mode==='pending-session'?{}:null,writeBlocked:false,blockedContext:null}));
+    }
+    const options=dependencies();
+    await assert.rejects(migrateOwnedSiteLoginCookies({...roots,...options,allowWriteTarget:true}),error=>!error.message.includes(dummyValue));
+    assert.deepEqual(await fs.readFile(marker),before);assert.equal(options.calls.filter(value=>value.type==='addCookies').length,0);
+    assert.equal(options.calls.filter(value=>value.type==='launch'&&value.profile.startsWith(roots.targetRoot)).length,0);
+  });
+});
+
+test('CLI forwards write opt-in only as the exact explicit flag',async()=>{
+  const calls=[],migrate=async value=>{calls.push(value);return {platformLoginVerified:false};},log=()=>{};
+  const args=['--source-root=source','--target-root=target'];
+  await loginCookiesMain(args,{migrate,log});assert.equal(calls[0].allowWriteTarget,undefined);
+  await loginCookiesMain([...args,'--allow-write-target'],{migrate,log});assert.equal(calls[1].allowWriteTarget,true);
+  for(const flags of [['--allow-write-target=true'],['--allow-write-target=false'],['--allow-write-target','--allow-write-target']]){
+    await assert.rejects(loginCookiesMain([...args,...flags],{migrate,log}));
+  }
+  assert.equal(calls.length,2);
+});
+
+test('an unknown session created while acquiring the lease stops authentication before launch',async t=>{
+  const roots=await workers(t,{targetReadOnly:false}),options=dependencies();
+  let releases=0;
+  const acquireLease=async(config,root)=>{
+    await fs.mkdir(path.join(root,'data/persistent-executor'),{recursive:true});
+    await fs.writeFile(path.join(root,'data/persistent-executor/session.json'),JSON.stringify({schemaVersion:1,bookId:config.bookId,
+      browserBackend:'headless',browserProfileDir:config.browserProfileDir,readOnly:config.readOnly??false,pending:{},writeBlocked:true,blockedContext:{}}));
+    return {release:async()=>{releases++;return {released:false,reason:'original-session-recovery-required'};}};
+  };
+  await assert.rejects(migrateOwnedSiteLoginCookies({...roots,...options,acquireLease,allowWriteTarget:true}));
+  assert.equal(options.calls.filter(value=>value.type==='launch').length,0);assert.equal(releases,1);
+  const state=JSON.parse(await fs.readFile(path.join(roots.sourceRoot,'data/persistent-executor/session.json'),'utf8'));
+  assert.equal(state.writeBlocked,true);assert.deepEqual(state.pending,{});
+});
+
 test('DPAPI subprocess arguments contain constant entropy/code, input stays in private stdin, and helper window/output errors stay hidden',async()=>{
   let parameters,stdin='';
   const spawnProcess=(command,args,options)=>{
@@ -124,16 +190,19 @@ test('real CurrentUser DPAPI protects and restores only a synthetic offline cook
 
 test('fresh offline owned Edge profiles persist a DPAPI-migrated synthetic site cookie without navigating', {timeout:60000},async t=>{
   if(process.platform!=='win32'){t.skip('Windows owned Edge fixture unavailable');return;}
-  const roots=await workers(t),sourceConfig=JSON.parse(await fs.readFile(path.join(roots.sourceRoot,'config/recorder.json'),'utf8'));
+  for(const targetReadOnly of [true,false])await t.test(targetReadOnly?'read-only target':'explicit write target',async child=>{
+  const roots=await workers(child,{targetReadOnly}),sourceConfig=JSON.parse(await fs.readFile(path.join(roots.sourceRoot,'config/recorder.json'),'utf8'));
   const profile=await prepareHeadlessProfile(sourceConfig,roots.sourceRoot);
   const options={channel:'msedge',headless:true,serviceWorkers:'block',args:['--disable-background-networking','--disable-component-update','--disable-sync','--no-first-run','--disable-default-apps','--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost','--proxy-server=http://127.0.0.1:9']};
   const sourceContext=await chromium.launchPersistentContext(profile,options);await sourceContext.route('**/*',route=>route.abort('blockedbyclient'));
   await sourceContext.addCookies([cookie()]);await sourceContext.close();
   const leaseDirectory=path.join(path.dirname(roots.sourceRoot),'offline-resource-leases');
-  const result=await migrateOwnedSiteLoginCookies({...roots,leaseDirectory});
+  const result=await migrateOwnedSiteLoginCookies({...roots,leaseDirectory,...(targetReadOnly?{}:{allowWriteTarget:true})});
   assert.equal(result.importedCookieCount,1);assert.equal(result.localCookieReadbackVerified,true);assert.equal(result.platformLoginVerified,false);
+  assert.equal(result.targetReadOnly,targetReadOnly);assert.equal(result.writeTargetExplicitlyAllowed,!targetReadOnly);
   assert.equal(result.persistentCookieReadbackVerified,true);assert.equal(result.targetPersistenceAudit.pageNavigationCount,0);assert.equal(result.targetPersistenceAudit.pageRequestCount,0);
   const targetConfig=JSON.parse(await fs.readFile(path.join(roots.targetRoot,'config/recorder.json'),'utf8'));
   const targetProfile=await prepareHeadlessProfile(targetConfig,roots.targetRoot),targetContext=await chromium.launchPersistentContext(targetProfile,options);
   try {await targetContext.route('**/*',route=>route.abort('blockedbyclient'));const found=await targetContext.cookies(['https://easylearn.baidu.com/']);assert.equal(found.filter(value=>value.name==='fixture_session'&&value.value===dummyValue).length,1);}finally{await targetContext.close();}
+  });
 });

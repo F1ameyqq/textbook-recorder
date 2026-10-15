@@ -23,7 +23,8 @@ function assertServiceIdentity(config,value){
 export async function recorderRequest(root,command,{configPath='config/recorder.json',fetchImpl=fetch,local=false}={}){
   const {config,control}=await loadController(root,configPath);
   const {action}=validateRecorderCommand(command,root),localStatus=action==='status';
-  if(config.readOnly&&['execute','complete-record-repair'].includes(action))throw new Error('readOnly controller 禁止 execute 和 complete-record-repair');
+  if(config.readOnly&&['execute','complete-record-repair','draft-roundtrip','draft-roundtrip-restore'].includes(action))throw new Error('readOnly controller 禁止 execute、complete-record-repair 和草稿往返写动作');
+  if(['draft-roundtrip','draft-roundtrip-restore'].includes(action)&&(config.browserBackend!=='headless'||config.focusMode!=='background'||config.windowMode!=='headless'))throw new Error('draft-roundtrip 只允许专用 headless 后台写入 worker');
   if(local&&!localStatus)throw new Error('--local 只适用于 status 内存快照');
   const response=await fetchImpl('http://127.0.0.1:'+control.port+'/'+(localStatus?(local?'health':'status'):'command'),{method:localStatus?'GET':'POST',headers:{'x-recorder-key':control.key,...(localStatus?{}:{'Content-Type':'application/json'})},...(localStatus?{}:{body:JSON.stringify(command)}),signal:AbortSignal.timeout(local?3000:55000)}),value=await response.json();
   if(!response.ok)throw new Error(value.error??'常驻服务调用失败');
