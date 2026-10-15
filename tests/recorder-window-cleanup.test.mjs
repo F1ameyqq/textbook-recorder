@@ -10,7 +10,7 @@ function fixture() {
   const context={pages:()=>[page]};page.context=()=>context;
   page.__persistentRecorder={status:()=>({bookId:100001,focusMode:'background',windowMode:'minimized'}),cleanupWindowHelper:async()=>{events.push('window-cleanup');return {bookId:100001,cleanup:{removed:true}};}};
   const session=Object.create(PersistentRecorderSession.prototype);
-  Object.assign(session,{bookId:100001,focusMode:'background',windowMode:'minimized',pageBindingId:'binding-one',windowHelperCleanupSupported:true,state:{pending:null},busy:false,closing:false,closed:false,dead:false,binding:true,statusPromise:null});
+  Object.assign(session,{bookId:100001,readOnly:false,focusMode:'background',windowMode:'minimized',pageBindingId:'binding-one',windowHelperCleanupSupported:true,state:{pending:null},busy:false,closing:false,closed:false,dead:false,binding:true,statusPromise:null});
   session.connection={client:{callTool:async({name,arguments:args})=>{assert.equal(name,'browser_run_code_unsafe');const result=await vm.runInNewContext(`(${args.code})(page)`,{page,URL,URLSearchParams});return {content:[{type:'text',text:JSON.stringify(result)}]};}},close:async()=>events.push('mcp-close')};
   session.cleanupOwnedTab=async()=>events.push('book-tab-cleanup');session.persist=async()=>{assert.equal(session.state.windowHelperCleanup.removed,true);events.push('persist');};
   return {session,events};

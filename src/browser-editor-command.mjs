@@ -1,7 +1,9 @@
 import { checkedPointerClick } from './checked-pointer-click.mjs';
 import { assertEditorNativeEmphasis } from './native-emphasis.mjs';
+import { assertEditorNativeScripts } from './native-scripts.mjs';
 import { activateRecorderPage, validateBrowserFocusMode, validateBrowserWindowMode } from './browser-focus.mjs';
 import { requireRecorderDocumentReady, assertRecorderDocumentSnapshot } from './browser-document-state.mjs';
+import { prepareReviewedLiteralDollarHtml, assertEditorLiteralDollarSafety } from './literal-dollar.mjs';
 
 /**
  * Insert already reviewed HTML through the browser's editing command.
@@ -11,7 +13,7 @@ import { requireRecorderDocumentReady, assertRecorderDocumentSnapshot } from './
 export async function insertReviewedEditorHtml(page, selector, html, { replace = false, timeoutMs = 20000, guard = async () => {}, allowGeneratedTrailingEmptyParagraph = false, focusMode = 'foreground', windowMode = 'normal' } = {}) {
   validateBrowserFocusMode(focusMode);
   validateBrowserWindowMode(windowMode);
-  if (focusMode === 'foreground' && windowMode === 'minimized') throw new Error('minimized 窗口只允许 background 模式');
+  if (focusMode === 'foreground' && windowMode !== 'normal') throw new Error('minimized/headless 只允许 background 模式');
   if (!page || typeof page.locator !== 'function') throw new Error('A Playwright page is required');
   if (typeof selector !== 'string' || !selector.trim()) throw new Error('An explicit editor selector is required');
   if (typeof html !== 'string' || !html.trim() || html.includes('\0')) throw new Error('Reviewed HTML must be nonempty and contain no NUL');
@@ -24,6 +26,7 @@ export async function insertReviewedEditorHtml(page, selector, html, { replace =
   }));
   if (!initial.editable) throw new Error('Target is not contenteditable');
   if (!replace && !initial.empty) throw new Error('Append command requires an empty editor; no content changed');
+  const literalDollars = await page.evaluate(prepareReviewedLiteralDollarHtml, html);
 
   await activateRecorderPage(page, focusMode, {windowMode,guard});
   await checkedPointerClick(page, editor, {timeout:timeoutMs,guard,focusMode,windowMode});
@@ -70,12 +73,14 @@ export async function insertReviewedEditorHtml(page, selector, html, { replace =
     finally { element.removeEventListener('beforeinput', listener); element.removeEventListener('input', listener); }
     if (!succeeded) throw new Error('Browser insertHTML command declined the insertion');
     return { command:'insertHTML', succeeded, selectionVerified:true, inputEvents };
-  }, { html, replace, backgroundBinding });
+  }, { html: literalDollars.html, replace, backgroundBinding });
   if (backgroundBinding) {
     const after = await requireRecorderDocumentReady(page, {focusMode,windowMode,guard});
     assertRecorderDocumentSnapshot(after, backgroundBinding);
     if (String(after.windowId) !== String(backgroundBinding.windowId)) throw new Error('Editor window identity changed during insertion');
+    if (after.browserBindingId !== backgroundBinding.browserBindingId) throw new Error('Editor headless browser identity changed during insertion');
   }
+  await assertEditorLiteralDollarSafety(page,selector,literalDollars);
 
   await page.waitForFunction(({ selector, html }) => {
     const actual = document.querySelector(selector);
@@ -143,7 +148,9 @@ export async function insertReviewedEditorHtml(page, selector, html, { replace =
   const profile=reviewedParagraphCountProfile(checked,allowGeneratedTrailingEmptyParagraph);if(!profile.accepted)checked.errors.unshift('Top-level paragraph count changed');
   if (checked.errors.length) throw new Error('Browser command readback mismatch: ' + checked.errors.join('; '));
   await assertEditorNativeEmphasis(page,selector,html);
-  return { ...result, paragraphCount:checked.paragraphCount, imageCount:checked.imageCount, addedGeneratedTrailingEmptyParagraph:profile.addedGeneratedTrailingEmptyParagraph };
+  await assertEditorNativeScripts(page,selector,html);
+  await assertEditorLiteralDollarSafety(page,selector,literalDollars);
+  return { ...result, paragraphCount:checked.paragraphCount, imageCount:checked.imageCount, addedGeneratedTrailingEmptyParagraph:profile.addedGeneratedTrailingEmptyParagraph, protectedLiteralDollarCount:literalDollars.count };
 }
 
 /** Opt-in permits only one entirely empty, unstyled native tail paragraph. */

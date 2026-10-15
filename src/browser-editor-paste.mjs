@@ -1,5 +1,6 @@
 import { insertReviewedEditorHtml } from './browser-editor-command.mjs';
 import { validateBrowserFocusMode, validateBrowserWindowMode } from './browser-focus.mjs';
+import { assertEditorNativeScripts } from './native-scripts.mjs';
 
 /** Preserve the full reviewed fragment, then paste only each native formula.
  * The platform's whole-fragment paste formatter removes unit spaces after sup.
@@ -143,5 +144,6 @@ export async function pasteReviewedEditorHtml(page, selector, html, {replace=fal
   },parsed.formulas);
   await guard();
   const counts=await editor.evaluate(element=>({paragraphCount:element.children.length,imageCount:element.querySelectorAll('img').length}));
+  await assertEditorNativeScripts(page,selector,html);
   return {command:formulaPasteCount?'insertHTML+formula-paste':'insertHTML',succeeded:true,selectionVerified:true,clipboardFormats:formulaPasteCount?['text/html','text/plain']:[],formulaPasteCount,removedNativeCaretMarkers:markerEdits,protectedAnswerSeparators:parsed.protectedAnswerSeparators,protectedFormulaBoundarySpaces:parsed.protectedFormulaBoundarySpaces,addedGeneratedTrailingEmptyParagraph:inserted.addedGeneratedTrailingEmptyParagraph,inputEvents,...counts};
 }

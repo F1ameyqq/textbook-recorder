@@ -66,7 +66,16 @@ export function readAppendAutosaveSnapshot(expected) {
         if (['SUP','SUB'].includes(node.tagName)) marks.push(node.tagName.toLowerCase());
         if (['B','STRONG'].includes(node.tagName)) marks.push('bold');
         if (['I','EM'].includes(node.tagName)) marks.push('italic');
-        if (node.tagName === 'U' || node.style.textDecorationLine?.split(/\s/u).includes('underline')) marks.push('underline');
+        const decorationLine = node.style.textDecorationLine || '';
+        const hasUnderline = decorationLine.split(/\s/u).includes('underline') || node.tagName === 'U' && !decorationLine;
+        if (hasUnderline) {
+          const decorationStyle = node.style.textDecorationStyle || 'solid';
+          if (!['solid', 'wavy'].includes(decorationStyle)) throw new Error('Unsupported authored underline style');
+          const underlineType = decorationStyle === 'wavy' ? 'underline-wavy' : 'underline';
+          const conflictingType = decorationStyle === 'wavy' ? 'underline' : 'underline-wavy';
+          if (marks.includes(conflictingType)) throw new Error('Conflicting authored underline styles');
+          marks.push(underlineType);
+        }
         const dot=node.style.textEmphasisStyle||node.style.webkitTextEmphasisStyle;
         if (dot && dot !== 'none') {
           const position=node.style.textEmphasisPosition||node.style.webkitTextEmphasisPosition;

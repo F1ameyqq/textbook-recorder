@@ -32,6 +32,23 @@ test('pending summary cannot present a previous terminal job as current',()=>{
   assert.deepEqual(summary.pauseControl,{schemaVersion:1,generation:2,paused:true});
 });
 
+test('draft summary retains lock and receipt diagnostics while its full blocked context stays in details',()=>{
+  const status={bookId:101,pending:null,writeBlocked:true,blockedContext:{kind:'draft-runtime-roundtrip',manifest:'private-plan',state:'private-journal',
+    baselinePath:'private-baseline',manifestSha256:'private-plan-hash',authorization:{userQuote:'private-authorization'}},
+    last:{id:'draft-owned',action:'draft-roundtrip',terminal:true,result:{kind:'draft-runtime-roundtrip',originalRecordId:901,saveRequests:1,uncertain:true,
+      recovery:{kind:'draft-runtime-roundtrip',writeUnlocked:false,baselineRestored:false,receiptsComplete:false,zeroNativeInputConfirmed:false,liveRestoreEligible:true}}}};
+  const summary=summarizeRecorderStatus(status);
+  assert.equal(summary.writeBlocked,true);assert.equal(summary.blockedContext,undefined);assert.equal(summary.job.action,'draft-roundtrip');
+  assert.equal(summary.job.result.originalRecordId,901);assert.equal(summary.job.result.saveRequests,1);
+  assert.equal(summary.job.result.recovery.liveRestoreEligible,true);assert.doesNotMatch(JSON.stringify(summary),/private-/u);
+  assert.equal(status.blockedContext.manifest,'private-plan');assert.deepEqual(summarizeRecorderStatus(summary),summary);
+});
+
+test('status request summary exposes lifecycle without private response details',()=>{
+  const summary=summarizeRecorderStatus({...terminal('old'),statusRequest:{state:'blocked',dispatched:true,transportReturned:false,servicePid:123,connectionCount:1,controlKey:'private key',rawResponse:'private response'}});
+  assert.equal(summary.statusRequest.state,'blocked');assert.equal(summary.statusRequest.transportReturned,false);assert.equal(summary.statusRequest.servicePid,123);assert.doesNotMatch(JSON.stringify(summary),/private key|private response|rawResponse|controlKey/u);
+});
+
 test('wait submits one command and polls locally until its own terminal proof',async t=>{
   const root=await workspace(t),commands=[];let id;
   const request=async(_root,command)=>{commands.push(command);if(command.action==='probe'){id=command.id;return {...terminal('old'),pending:{id,action:'probe'}};}return commands.length<4?{...terminal('old'),pending:{id,action:'probe'},remote:{job:{id,action:'probe',running:true,terminal:false}}}:terminal(id);};

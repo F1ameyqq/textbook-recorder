@@ -5,8 +5,9 @@ const fields = (value, names) => Object.fromEntries(names.filter(name => value?.
 /** Keep task identity and recovery blockers; large evidence stays in local files. */
 export function summarizeRecorderStatus(status) {
   if (!object(status)) throw new Error('执行器状态不是对象');
-  const summary = fields(status, ['bookId', 'sessionPath', 'focusMode', 'windowMode', 'requestedFocusMode', 'requestedWindowMode', 'connection', 'authConfigured', 'connectionCount', 'reconnectBlocked', 'tabCleanup', 'writeBlocked', 'error', 'taskNotRetried', 'closed', 'started', 'id', 'stopRequested', 'rejected']);
+  const summary = fields(status, ['bookId', 'sessionPath', 'browserBackend', 'browserProfileDir', 'accountScope', 'readOnly', 'requestedReadOnly', 'readOnlyNetwork', 'requestedBrowserBackend', 'requestedBrowserProfileDir', 'focusMode', 'windowMode', 'requestedFocusMode', 'requestedWindowMode', 'connection', 'authConfigured', 'connectionCount', 'reconnectBlocked', 'tabCleanup', 'writeBlocked', 'error', 'localTerminalError', 'statusSource', 'taskNotRetried', 'closed', 'started', 'id', 'stopRequested', 'rejected']);
   summary.pending = status.pending ? fields(status.pending, ['id', 'action']) : null;
+  if (status.statusRequest) summary.statusRequest = fields(status.statusRequest, ['state', 'startedAt', 'elapsedMs', 'dispatched', 'transportReturned', 'remoteReturned', 'responseOutcome', 'servicePid', 'connectionCount']);
   if (status.pauseControl) summary.pauseControl = fields(status.pauseControl, ['schemaVersion', 'generation', 'paused']);
   if (status.continuationFence) summary.continuationFence = fields(status.continuationFence, ['schemaVersion', 'previousTerminalId', 'pauseGeneration', 'paused']);
   if (status.reconnect) summary.reconnect = fields(status.reconnect, ['automaticAttempts', 'maximum', 'limited']);
@@ -15,14 +16,15 @@ export function summarizeRecorderStatus(status) {
     ? status.remote?.job?.id === status.pending.id ? status.remote.job : null
     : status.last ?? status.remote?.job ?? status.job;
   if (job) {
-    summary.job = fields(job, ['id', 'action', 'running', 'terminal', 'phase', 'phaseTaskId', 'adapterPhase', 'error', 'evidenceError', 'preflightPath', 'stopRequested']);
-    if (job.progress) summary.job.progress = fields(job.progress, ['status', 'completed', 'total', 'verifiedReadbacks', 'downloaded', 'skipped', 'requestedPages', 'systemPage', 'paused']);
+    summary.job = fields(job, ['id', 'action', 'running', 'terminal', 'phase', 'phaseTaskId', 'adapterPhase', 'error', 'evidenceError', 'preflightPath', 'stopRequested', 'readOnlyNetwork']);
+    if (job.terminalDiagnostic) summary.job.terminalDiagnostic = fields(job.terminalDiagnostic, ['commandId', 'action', 'statusSource', 'phase', 'taskId', 'phaseElapsedMs', 'finishedAt', 'writeBlocked', 'transportBlocked']);
+    if (job.progress) summary.job.progress = fields(job.progress, ['status', 'completed', 'total', 'verifiedReadbacks', 'downloaded', 'skipped', 'requestedPages', 'systemPage', 'paused', 'observedSaveRequests', 'receipts']);
     if (job.result) {
-      summary.job.result = fields(job.result, ['bookId', 'taskId', 'stateStatus', 'stopReason', 'counts', 'uncertain', 'writePerformed', 'connected', 'recordCount', 'recordId', 'status', 'scopes', 'records', 'downloaded', 'skipped', 'requestedPages', 'paused', 'manifestPath', 'statePath', 'recordsPath', 'inventoryPath', 'indexPath', 'readbackPath', 'readbackEvidence', 'sectionEvidence', 'screenshotPath', 'outputDirectory']);
+      summary.job.result = fields(job.result, ['kind', 'bookId', 'taskId', 'stateStatus', 'stopReason', 'counts', 'uncertain', 'writePerformed', 'connected', 'recordCount', 'recordId', 'status', 'scopes', 'records', 'downloaded', 'skipped', 'requestedPages', 'paused', 'manifestPath', 'manifestSha256', 'statePath', 'recordsPath', 'inventoryPath', 'indexPath', 'readbackPath', 'readbackEvidence', 'sectionEvidence', 'screenshotPath', 'outputDirectory', 'readOnlyNetwork', 'baselineSha256', 'originalRecordId', 'saveRequests', 'restored', 'preservedRecords', 'outcome', 'writeUnlocked', 'treeSnapshotPath', 'basicinfo', 'roots', 'visibleLeaves']);
       // `records` is an inventory count, never the exported records themselves.
       if (typeof summary.job.result.records !== 'number') delete summary.job.result.records;
       if (job.result.comparison) summary.job.result.comparison = fields(job.result.comparison, ['ok', 'errors']);
-      if (job.result.recovery) summary.job.result.recovery = fields(job.result.recovery, ['outcome', 'writeUnlocked', 'taskId', 'bookId', 'recordId', 'evidencePath', 'errors']);
+      if (job.result.recovery) summary.job.result.recovery = fields(job.result.recovery, ['kind', 'outcome', 'writeUnlocked', 'taskId', 'bookId', 'recordId', 'evidencePath', 'errors', 'baselineRestored', 'allSaveRequestsSettled', 'receiptsComplete', 'zeroNativeInputConfirmed', 'liveRestoreEligible']);
       if (job.result.pendingWrite) summary.job.result.pendingWrite = {
         ...fields(job.result.pendingWrite, ['status', 'phase', 'evidencePath']),
         task: fields(job.result.pendingWrite.task, ['id']),

@@ -5,8 +5,10 @@ import path from 'node:path';
 import { resolveAssetPath } from './core.mjs';
 import { ANALYSIS_SEPARATOR, isAnalysisSeparator, assertAnalysisSeparator, renderAnalysisSeparator, compareAnalysisSeparatorImage } from './analysis-separator.mjs';
 import { assertNativeEmphasis, renderNativeEmphasis, nativeEmphasisSignature } from './native-emphasis.mjs';
+import { expectedNativeScripts, nativeScriptsSignature } from './native-scripts.mjs';
 import { validBeforePlusProof } from './pre-append-recovery.mjs';
 import { validHistoricalNetworkRecoveryProof } from './historical-network-recovery.mjs';
+import { hasNativeFormulaMarkup } from './literal-dollar.mjs';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const positive = value => Number.isSafeInteger(value) && value > 0;
@@ -143,10 +145,10 @@ export function validateNewSystemManifest(manifest, baseDir = process.cwd()) { r
 
 /** Each block has its own paragraph so centered images cannot center subsequent options. */
 export function renderBlockHtml(block, baseDir = process.cwd()) {
+  if (isAnalysisSeparator(block)) return renderAnalysisSeparator(block);
   assertNativeEmphasis(block);
   if (block.strictSpacing !== undefined && (block.type !== 'text' || typeof block.strictSpacing !== 'boolean')) throw new Error('strictSpacing 仅允许 text 段落的布尔值');
   if (block.underline !== undefined || block.textEmphasis !== undefined || block.style !== undefined) throw new Error('未知格式属性，必须使用emphasis范围');
-  if (isAnalysisSeparator(block)) return renderAnalysisSeparator(block);
   if (block?.type === 'image') {
     if (block.align !== 'center') throw new Error('图片必须明确居中');
     const image = asset(block.path, baseDir);
@@ -185,7 +187,7 @@ export function expectedEditor(editor, baseDir = process.cwd()) {
       const image = asset(block.path, baseDir);
       return { sha256: image.sha256, path: block.path };
     }),
-    paragraphs: editor.blocks.map(block => ({ text: blockText(block), imageCount: block.type === 'image' || isAnalysisSeparator(block) ? 1 : 0, align: block.type === 'image' ? 'center' : 'left', direction: 'ltr', ...(isAnalysisSeparator(block) ? { type: 'analysis-separator' } : {}), ...(block.parts !== undefined || block.strictSpacing === true ? { strictSpacing: true } : {}) })),
+    paragraphs: editor.blocks.map(block => ({ text: blockText(block), imageCount: block.type === 'image' || isAnalysisSeparator(block) ? 1 : 0, align: block.type === 'image' ? 'center' : 'left', direction: 'ltr', nativeScripts:expectedNativeScripts(block), ...(isAnalysisSeparator(block) ? { type: 'analysis-separator' } : {}), ...(block.parts !== undefined || block.strictSpacing === true ? { strictSpacing: true } : {}) })),
   };
 }
 
@@ -212,6 +214,16 @@ export function compareNewSystemReadback(task, readback, { baseDir = process.cwd
     const expected = expectedEditor(task[side], baseDir);
     const actual = readback[side];
     if (!object(actual)) { errors.push(`回读 ${side} 缺失`); continue; }
+    // The generic renderer accepts no native formula blocks. Ordinary text
+    // equality must not hide extra math nodes excluded by the editor reader.
+    if (actual.formulas !== undefined && (!Array.isArray(actual.formulas) || actual.formulas.length)
+        || hasNativeFormulaMarkup(actual.html)
+        || actual.literalDollarSafety?.formulaCount !== undefined && actual.literalDollarSafety.formulaCount !== 0) errors.push(`${side} 普通题单出现未审原生公式`);
+    if (actual.literalDollarSafety !== undefined) {
+      const safety = actual.literalDollarSafety, count = expected.text.split('$').length - 1;
+      if (!object(safety) || !Number.isSafeInteger(safety.count) || safety.count !== count
+          || !Number.isSafeInteger(safety.unsafeCount) || safety.unsafeCount !== 0) errors.push(`${side} 普通货币 $ 字符数量或隔离结构不一致`);
+    }
     if (typeof actual.text !== 'string' || sameText(actual.text) !== sameText(expected.text)) errors.push(`${side} 文本与题单不一致`);
     if (task[side].blocks.some(block => block.parts !== undefined) && (typeof actual.text !== 'string' || spacedText(actual.text) !== spacedText(expected.text))) errors.push(`${side} 分段答案或8个半角空格间隔不一致`);
     if (!Array.isArray(actual.images)) errors.push(`${side} 图片列表缺失`);
@@ -241,6 +253,22 @@ export function compareNewSystemReadback(task, readback, { baseDir = process.cwd
           try {
             if (!native || !Array.isArray(native.marks) || nativeEmphasisSignature(blockText(sourceBlock),marks) !== nativeEmphasisSignature(native.text,native.marks)) errors.push(`${side} 段落 ${index+1} 加点/下划线范围与原文不一致`);
           } catch(error) { errors.push(`${side} 段落 ${index+1} 加点/下划线回读无效: ${error.message}`); }
+        }
+        // Legacy manifests still retain their full-editor sup/sub array check.
+        // Combined authored emphasis/scripts additionally require locations;
+        // any location metadata returned for an old task is checked as well.
+        const scriptExpected = want?.nativeScripts, scriptActual = item.nativeScripts;
+        if (sourceBlock?.emphasis !== undefined && scriptExpected?.marks.length || scriptActual !== undefined) {
+          try {
+            // Native image paragraphs may carry BR caret placeholders. Only
+            // empty/LF-only metadata with no script marks is non-text content;
+            // all image identity/position and full-editor tag checks remain.
+            const imagePlaceholder = (sourceBlock?.type === 'image' || isAnalysisSeparator(sourceBlock))
+              && object(scriptActual) && typeof scriptActual.text === 'string' && /^\n*$/u.test(scriptActual.text)
+              && Array.isArray(scriptActual.marks) && scriptActual.marks.length === 0;
+            const scriptText = imagePlaceholder ? '' : scriptActual?.text;
+            if (!scriptExpected || !scriptActual || nativeScriptsSignature(scriptExpected.text,scriptExpected.marks) !== nativeScriptsSignature(scriptText,scriptActual.marks)) errors.push(`${side} 段落 ${index+1} 上下标范围与原文不一致`);
+          } catch(error) { errors.push(`${side} 段落 ${index+1} 上下标回读无效: ${error.message}`); }
         }
         if (!want || sameText(item?.text ?? '') !== sameText(want.text) || item.imageCount !== want.imageCount) errors.push(`${side} 段落 ${index + 1} 内容或图片位置不一致`);
         const spacingText = sourceBlock?.strictSpacing === true ? strictSpacedText : spacedText;

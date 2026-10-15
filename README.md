@@ -6,6 +6,8 @@
 
 本地准备可用 `workflow:mapping` 从已确认题序和目录基线生成待填写骨架，`workflow:conflicts` 集中显示配答问题与候选，`workflow:materials` 为指定完整题或修订差异生成定向原图材料包。三项都只处理明确提供的本地材料，保留待审状态；接口见[本地工作流工具](docs/workflow-tools.md)。
 
+独立运行时还提供多书 fleet、每书专用无头浏览器、本地状态快照和阶段耗时诊断。默认扩展模式保持兼容，运行中的录入不会自动切换。配置、并行隔离及平台验收边界见[独立运行时](docs/runtime-isolation.md)。
+
 ## 让 agent 使用 skill
 
 先取得完整仓库，再以仓库根作为 agent 工作目录。支持仓库 skill 发现的 agent 可调用 `$textbook-recorder`；未出现在列表时，可明确要求读取 [.agents/skills/textbook-recorder/SKILL.md](.agents/skills/textbook-recorder/SKILL.md)。其他 agent 也可显式读取该文件，使用自己的 shell 和本地读图工具按工作流操作，不需要相同的 CUA 插件。

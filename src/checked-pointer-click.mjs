@@ -17,7 +17,7 @@ const sameRect = (left, right) => ['x', 'y', 'width', 'height']
  */
 export async function checkedPointerClick(page, locator, { guard, timeout = 20000, focusMode = 'foreground', windowMode = 'normal', preserveEditorFocus = false, beforeInput } = {}) {
   validateBrowserFocusMode(focusMode); validateBrowserWindowMode(windowMode);
-  if (focusMode === 'foreground' && windowMode === 'minimized') throw new Error('minimized 只支持 background 模式');
+  if (focusMode === 'foreground' && windowMode !== 'normal') throw new Error('minimized/headless 只支持 background 模式');
   if (!page || typeof page.isClosed !== 'function' || !locator || typeof locator.page !== 'function'
       || locator.page() !== page) throw new Error('Checked pointer click requires a locator on the supplied page');
   if (typeof guard !== 'function') throw new Error('Checked pointer click requires a scope guard');
@@ -39,12 +39,13 @@ export async function checkedPointerClick(page, locator, { guard, timeout = 2000
   const background = focusMode === 'background';
   const minimized = focusMode === 'background' && windowMode === 'minimized';
   if (typeof preserveEditorFocus !== 'boolean' || preserveEditorFocus && !minimized) throw new Error('Preserving editor focus is restricted to minimized background Save activation');
-  if(beforeInput!==undefined&&(!preserveEditorFocus||typeof beforeInput!=='function'))throw new Error('Pre-Save assertion is restricted to preserved editor focus');
+  if(beforeInput!==undefined&&typeof beforeInput!=='function')throw new Error('Pre-input assertion must be a function');
   const checkBackgroundWindow = async () => {
     const next = await requireRecorderDocumentReady(page, { focusMode, windowMode, guard });
     if (documentBinding) {
       assertRecorderDocumentSnapshot(next, documentBinding);
       if (String(next.windowId) !== String(documentBinding.windowId)) throw new Error('Recorder window identity changed during input checks');
+      if (next.browserBindingId !== documentBinding.browserBindingId) throw new Error('Recorder headless browser identity changed during input checks');
     }
     documentBinding = next;
   };
@@ -137,7 +138,18 @@ export async function checkedPointerClick(page, locator, { guard, timeout = 2000
   let editorFocus;
   try {
     remaining();
-    if(beforeInput){await beforeInput();remaining();}
+    if(beforeInput){
+      await beforeInput();
+      remaining();
+      // The assertion can take time. Recheck scope and hit geometry before the
+      // first native input, without moving focus or retrying a failed check.
+      await guard();
+      if(background)await checkBackgroundWindow();
+      await ready();
+      const checked=await sample();
+      if(!sameRect(final.rect,checked.rect))throw new Error('Checked pointer target moved during pre-input assertion');
+      remaining();
+    }
     if (minimized) {
       await locator.evaluate((element,{point,binding,preserveEditorFocus,key})=>{
         if(location.href!==binding.url||performance.timeOrigin!==binding.timeOrigin)throw new Error('Background activation document changed');

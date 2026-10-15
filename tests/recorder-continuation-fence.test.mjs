@@ -124,6 +124,7 @@ test('missing terminal acceptance proof does not promote a guarded task to safe 
 test('pause is persisted before bridge dispatch and synchronization does not increment it twice',async t=>{
   const f=await fixture(t);let session,observed;
   session=await sessionFor(f,{onPause:async payload=>{observed=JSON.parse(await fs.readFile(session.statePath,'utf8')).pauseControl;assert.equal(payload.pauseGeneration,1);}});
+  await session.status({connect:true});
   const paused=await session.command({action:'pause'});assert.deepEqual(observed,{schemaVersion:1,generation:1,paused:true});assert.equal(paused.continuationFence.pauseGeneration,1);assert.equal(f.bridge.status().continuationFence.pauseGeneration,1);await session.close();
 });
 
@@ -138,12 +139,26 @@ test('a lost pause response leaves the durable latch set both before and after b
 
 test('read-only inspection after connection loss or service restart restores the durable pause into a new bridge',async t=>{
   for(const mode of ['reconnect','restart'])await t.test(mode,async child=>{
-    const f=await fixture(child);let session=await sessionFor(f);await session.command({action:'pause'});
+    const f=await fixture(child);let session=await sessionFor(f);await session.status({connect:true});await session.command({action:'pause'});
     if(mode==='restart'){await session.close();session=await sessionFor(f);}else await session.connection.close();
     await replaceBridge(f);assert.equal(f.bridge.status().continuationFence.paused,false);
     await session.command({id:'inspect-'+mode,action:'probe'});await terminal(f.bridge);const inspected=await session.status();assert.equal(inspected.connectionCount,2);assert.deepEqual(inspected.pauseControl,{schemaVersion:1,generation:1,paused:true});assert.equal(inspected.continuationFence.paused,true);assert.equal(f.bridge.status().continuationFence.pauseGeneration,1);
     await assert.rejects(session.command({id:'auto-'+mode,action:'execute',args:f.args,continuationGuard:initialGuard(inspected.continuationFence,inspected.connectionCount)}),/未提交任务/u);assert.equal(f.appends,0);assert.equal(session.state.pending,null);assert.equal(session.state.writeBlocked,false);await session.close();
   });
+});
+
+test('cold pause stays local and restores into the first bridge after a service restart',async t=>{
+  const f=await fixture(t);let session=await sessionFor(f);
+  const paused=await session.command({action:'pause'});
+  assert.equal(paused.remotePauseConfirmed,false);assert.equal(paused.connectionCount,0);assert.equal(session.connection,null);
+  assert.deepEqual(JSON.parse(await fs.readFile(session.statePath,'utf8')).pauseControl,{schemaVersion:1,generation:1,paused:true});
+  await session.close();session=await sessionFor(f);await replaceBridge(f);
+  assert.equal(f.bridge.status().continuationFence.paused,false);
+  await session.command({id:'inspect-after-cold-pause',action:'probe'});await terminal(f.bridge);
+  const inspected=await session.status();assert.equal(inspected.connectionCount,1);assert.deepEqual(inspected.pauseControl,{schemaVersion:1,generation:1,paused:true});
+  assert.equal(inspected.continuationFence.paused,true);assert.equal(f.bridge.status().continuationFence.pauseGeneration,1);
+  await assert.rejects(session.command({id:'auto-after-cold-pause',action:'execute',args:f.args,continuationGuard:initialGuard(inspected.continuationFence,inspected.connectionCount)}),/未提交任务/u);
+  assert.equal(f.appends,0);assert.equal(inspected.pending,null);assert.equal(inspected.writeBlocked,false);await session.close();
 });
 
 test('legacy sessions default to an unpaused generation zero and malformed pause state fails closed',async t=>{

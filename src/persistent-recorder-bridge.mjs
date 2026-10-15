@@ -10,11 +10,15 @@ import {validateNewSystemManifest,createNewSystemRun,runNewSystemBatch,compareNe
 import {inspectReviewedBatch} from './review-preflight.mjs';
 import {collectSourcePages} from './source-collector.mjs';
 import {validateRecorderConfig,validateRecorderCommand,assertRecorderPage,existingWorkspacePath,existingWorkspaceDirectory,writableWorkspacePath,prepareRuntimeDirectory} from './recorder-config.mjs';
+import {recorderCommandFingerprint} from './recorder-terminal-evidence.mjs';
+import {readonlyNetworkGuard,readonlyNetworkCommandEvidence} from './readonly-network-guard.mjs';
+import {waitVisibleByTimer} from './timer-visible-wait.mjs';
+import {waitForRecorderDocumentReady} from './browser-document-state.mjs';
 
 const copy=structuredClone;
 const clean=error=>String(error?.message??'操作失败').replace(/(?:https?|wss?|file):\/\/\S+/giu,'[网址省略]').replace(/\b(?:token|cookie|authorization|password)\s*[:=][^\r\n]*/giu,'[凭据省略]').slice(0,500);
 async function atomic(root,file,value){await writableWorkspacePath(root,file);await prepareRuntimeDirectory(root,path.dirname(file));const temp=file+'.'+randomUUID()+'.tmp';await writableWorkspacePath(root,temp);const handle=await fs.open(temp,'wx');try{await handle.writeFile(JSON.stringify(value,null,2));await handle.sync();}finally{await handle.close();}await writableWorkspacePath(root,file);await fs.rename(temp,file);}
-const pendingSummary=adapter=>{const pending=adapter?.pendingWrite;return pending?.status==='pending'?{task:{id:pending.task.id},status:'pending',phase:pending.phase,evidencePath:pending.evidencePath}:null;};
+const pendingSummary=adapter=>{const pending=adapter?.pendingWrite;return pending?.status==='pending'?{...(pending.task?.id?{task:{id:pending.task.id}}:{}),...(pending.kind?{kind:pending.kind}:{}),status:'pending',phase:pending.phase,evidencePath:pending.evidencePath}:null;};
 
 /** Read only the exact empty editors and their owning app instance. */
 export function readRecorderWindowPreparationSnapshot(bookId){
@@ -49,11 +53,13 @@ export function readRecorderWindowPreparationSnapshot(bookId){
 
 /** A typed Node-side bridge. It never submits review, deletes, or runs arbitrary code. */
 export async function installPersistentBridge({page,config,adapterFactory=options=>new NewSystemAdapter(options)}){
-  const validated=validateRecorderConfig({bookId:config.bookId,origin:config.origin,inputMode:config.inputMode,focusMode:config.focusMode,windowMode:config.windowMode});
+  const validated=validateRecorderConfig({bookId:config.bookId,origin:config.origin,inputMode:config.inputMode,focusMode:config.focusMode,windowMode:config.windowMode,browserBackend:config.browserBackend,browserProfileDir:config.browserProfileDir,readOnly:config.readOnly});
   assertRecorderPage(page.url(),validated.bookId);
-  if(page.__persistentRecorder){const existing=page.__persistentRecorder.status();if(existing.bookId!==validated.bookId||existing.focusMode!==validated.focusMode||existing.windowMode!==validated.windowMode)throw new Error('已存在桥接的书籍或浏览器模式不匹配');return page.__persistentRecorder;}
+  if(page.__persistentRecorder){const existing=page.__persistentRecorder.status();if(existing.bookId!==validated.bookId||existing.focusMode!==validated.focusMode||existing.windowMode!==validated.windowMode||(existing.readOnly??false)!==(validated.readOnly??false))throw new Error('已存在桥接的书籍、浏览器或 readOnly 模式不匹配');return page.__persistentRecorder;}
   const root=await fs.realpath(config.root),dataDir=path.join(root,'data/persistent-executor');
   await prepareRuntimeDirectory(root,dataDir);await prepareRuntimeDirectory(root,path.join(dataDir,'jobs'));
+  const networkGuard=validated.readOnly?readonlyNetworkGuard(page,{bookId:validated.bookId}):null;
+  const readonlyIdentity=()=>validated.readOnly?{readOnly:true,readOnlyNetwork:networkGuard.snapshot()}:{};
   const guard=()=>assertRecorderPage(page.url(),validated.bookId);
   let adapter,job=null,stopping=false,pauseGeneration=0,pauseLatched=false,normalWindowPreparation=null;
   const continuationFence=()=>({schemaVersion:1,previousTerminalId:job?.terminal===true?job.id:null,pauseGeneration,paused:pauseLatched});
@@ -102,7 +108,30 @@ export async function installPersistentBridge({page,config,adapterFactory=option
     const reportPath=path.join(dataDir,'jobs',job.id,'preflight.json');await atomic(root,reportPath,{bookId:validated.bookId,manifestPath,manifestSha256:createHash('sha256').update(bytes).digest('hex'),at:new Date().toISOString(),...review});job.preflightPath=reportPath;
     return {manifestPath,manifest,baseDir,statePath,state};
   };
+  const loadDraft=async(args,action)=>{
+    stage('draft-plan');
+    if(Object.keys(args).some(key=>!['manifest','state'].includes(key))||typeof args.state!=='string')throw new Error('草稿动作只接受原计划 manifest/state');
+    const module=await import('./draft-runtime-roundtrip.mjs'),plan=await module.loadDraftRuntimePlan(root,args.manifest),statePath=await writableWorkspacePath(root,args.state);
+    if(plan.bookId!==validated.bookId||statePath===plan.manifestPath||statePath===plan.baseline.path)throw new Error('草稿计划书籍或 journal 路径不符');
+    const context={kind:plan.kind,manifest:plan.manifestPath,manifestSha256:plan.manifestSha256,state:statePath};
+    if(['draft-roundtrip','draft-roundtrip-restore'].includes(action)){
+      const state=JSON.parse(await fs.readFile(await existingWorkspacePath(root,path.join(dataDir,'session.json')),'utf8')),bound=state.pending?.reviewContext,blocked=state.blockedContext;
+      if(state.bookId!==validated.bookId||state.readOnly!==false||state.browserBackend!=='headless'||state.browserProfileDir!==validated.browserProfileDir
+        ||state.pending?.id!==job.id||state.pending.action!==action||state.pending.servicePid!==process.pid||state.writeBlocked!==true
+        ||!bound||!blocked||Object.keys(context).some(key=>bound[key]!==context[key]||blocked[key]!==context[key]))throw new Error('草稿写动作缺少同一命令冻结的原计划、journal 和写入锁');
+    }
+    job.draftContext=context;
+    const reportPath=path.join(dataDir,'jobs',job.id,'preflight.json');await atomic(root,reportPath,{kind:'draft-runtime-preflight',bookId:plan.bookId,
+      manifestPath:plan.manifestPath,manifestSha256:plan.manifestSha256,statePath,baselinePath:plan.baseline.path,baselineSha256:plan.baseline.sha256,at:new Date().toISOString()});job.preflightPath=reportPath;
+    return {module,plan,statePath};
+  };
   const execute=async(action,args)=>{
+    if(['draft-roundtrip','draft-roundtrip-restore'].includes(action)||action==='reconcile'&&JSON.parse(await fs.readFile(await existingWorkspacePath(root,args.manifest),'utf8')).kind==='draft-runtime-roundtrip'){
+      const context=await loadDraft(args,action);stage('connecting');const active=await getAdapter();
+      const options={adapter:active,plan:context.plan,statePath:context.statePath,checkpoint:async event=>{guard();stage(event.phase);job.progress={status:event.phase,observedSaveRequests:event.observedSaveRequests,receipts:event.receipts?.length??0};},stopRequested:()=>stopping};
+      if(action==='reconcile'){stage('draft-readonly-reconcile');return context.module.reconcileDraftRuntimeRoundtrip(options);}
+      stage(action==='draft-roundtrip'?'draft-roundtrip':'draft-restore');return action==='draft-roundtrip'?context.module.runDraftRuntimeRoundtrip(options):context.module.restoreDraftRuntimeRoundtrip(options);
+    }
     if(action==='collect'){
       stage('connecting');const active=await getAdapter();
       const guardNavigation=async()=>{guard();if(active._busy||active._uncertain||pendingSummary(active))throw new Error('存在未完成编辑或待核对保存，禁止采集导航');};
@@ -111,17 +140,38 @@ export async function installPersistentBridge({page,config,adapterFactory=option
     }
     if(action==='probe'){
       stage('connecting');const active=await getAdapter();
-      if(args.inventory){stage('inventory');guard();await page.reload({waitUntil:'domcontentloaded'});await active.guard({waitForEditors:false});const inventoryPath=path.join(dataDir,'jobs',job.id,'inventory.json'),inventory={bookId:validated.bookId,startedAt:new Date().toISOString(),complete:false,scopes:[]};await atomic(root,inventoryPath,inventory);await active.inventory({onScope:async(row,completed,total)=>{guard();inventory.scopes.push(row);await atomic(root,inventoryPath,inventory);job.progress={status:'reading_inventory',completed,total};}});inventory.complete=true;inventory.finishedAt=new Date().toISOString();await atomic(root,inventoryPath,inventory);return {bookId:validated.bookId,writePerformed:false,inventoryPath,scopes:inventory.scopes.length,records:inventory.scopes.reduce((n,row)=>n+row.records.length,0)};}
+      if(args.treeSnapshot){
+        stage('draft-tree-snapshot');const {readDraftBookInfo}=await import('./draft-runtime-roundtrip.mjs'),info=await readDraftBookInfo(active);
+        await waitForRecorderDocumentReady(page,{focusMode:validated.focusMode,windowMode:validated.windowMode,timeoutMs:active.directoryTimeout,guard:()=>active.guard({waitForEditors:false})});
+        await waitVisibleByTimer(page.locator('.el-tree'),{timeout:active.directoryTimeout,name:'教材目录树',targetRole:'directory-root'});guard();
+        await waitVisibleByTimer(page.locator('.el-tree-node__content').first(),{timeout:active.directoryTimeout,name:'教材目录首节点',targetRole:'directory-root'});guard();
+        const tree=await page.evaluate(()=>{
+          const norm=value=>String(value??'').replace(/\s+/gu,' ').trim(),content=node=>node.querySelector(':scope > .el-tree-node__content');
+          const visible=element=>Boolean(element&&getComputedStyle(element).display!=='none'&&getComputedStyle(element).visibility!=='hidden'&&element.getClientRects().length);
+          const path=node=>{const labels=[];for(let current=node;current;current=current.parentElement?.closest('.el-tree-node'))labels.unshift(norm(content(current)?.innerText));return labels;};
+          const trees=[...document.querySelectorAll('.el-tree')];if(trees.length!==1)throw new Error('教材目录树不能唯一确认');
+          const nodes=[...trees[0].querySelectorAll('.el-tree-node')],roots=nodes.filter(node=>!node.parentElement?.closest('.el-tree-node'));
+          return {treeCount:trees.length,treeNodeCount:nodes.length,contentCount:trees[0].querySelectorAll('.el-tree-node__content').length,
+            roots:roots.map(node=>({label:norm(content(node)?.innerText),visible:visible(content(node)),expanded:node.classList.contains('is-expanded')})),
+            visibleLeaves:nodes.filter(node=>visible(content(node))&&content(node).querySelector('.el-tree-node__expand-icon.is-leaf')&&!node.querySelector(':scope > .el-tree-node__children > .el-tree-node'))
+              .map(node=>{const labels=path(node);return {chapterLabel:labels.length>1?labels.slice(0,-1).join(' > '):labels[0],sectionLabel:labels.at(-1),path:labels};})};
+        });guard();
+        const basicinfo={bookId:info.bookId,checkedAt:info.checkedAt,status:info.status,stateName:info.stateName,canEditType:info.canEditType,
+          ...(['string','number','boolean'].includes(typeof info.canEdit)||info.canEdit===null?{canEdit:info.canEdit}:{})};
+        const treeSnapshotPath=path.join(dataDir,'jobs',job.id,'tree-snapshot.json');await atomic(root,treeSnapshotPath,{kind:'draft-tree-snapshot',bookId:validated.bookId,at:new Date().toISOString(),basicinfo,...tree});
+        return {bookId:validated.bookId,...readonlyIdentity(),writePerformed:false,treeSnapshotPath,basicinfo,roots:tree.roots.length,visibleLeaves:tree.visibleLeaves.length};
+      }
+      if(args.inventory){stage('inventory');guard();await page.reload({waitUntil:'domcontentloaded'});await active.guard({waitForEditors:false});const inventoryPath=path.join(dataDir,'jobs',job.id,'inventory.json'),inventory={bookId:validated.bookId,startedAt:new Date().toISOString(),complete:false,scopes:[]};await atomic(root,inventoryPath,inventory);await active.inventory({onScope:async(row,completed,total)=>{guard();inventory.scopes.push(row);await atomic(root,inventoryPath,inventory);job.progress={status:'reading_inventory',completed,total};}});inventory.complete=true;inventory.finishedAt=new Date().toISOString();await atomic(root,inventoryPath,inventory);return {bookId:validated.bookId,...readonlyIdentity(),writePerformed:false,inventoryPath,scopes:inventory.scopes.length,records:inventory.scopes.reduce((n,row)=>n+row.records.length,0)};}
       stage('directory-read');const serverSnapshotAt=new Date().toISOString();if(args.sectionLabel)await active.read({target:{chapterLabel:args.chapterLabel,sectionLabel:args.sectionLabel,record:1}},{refresh:true});guard();let recordsPath=null;
       if(args.exportRecords){recordsPath=path.join(dataDir,'jobs',job.id,'scope-records.json');await atomic(root,recordsPath,{bookId:validated.bookId,chapterLabel:args.chapterLabel,sectionLabel:args.sectionLabel,nodeID:active._nodeID,serverSnapshotAt,at:new Date().toISOString(),records:copy(active._directoryRecords)});}
-      return {bookId:validated.bookId,connected:true,recordCount:args.sectionLabel?active._directoryRecords.length:null,recordsPath,writePerformed:false};
+      return {bookId:validated.bookId,...readonlyIdentity(),connected:true,recordCount:args.sectionLabel?active._directoryRecords.length:null,recordsPath,writePerformed:false};
     }
     const context=await load(args,action);stage('connecting');const active=await getAdapter();active.baseDir=context.baseDir;
     if(action==='readback'){
       const task=context.manifest.tasks.find(row=>row.id===args.taskId);if(!task)throw new Error('任务不在题单中');stage('fresh-readback',task.id);const startedAt=new Date().toISOString(),found=await active.read(task,{refresh:true}),at=new Date().toISOString(),comparison=found.status==='found'?compareNewSystemReadback(task,found,{baseDir:context.baseDir,bookId:validated.bookId}):null;
       const readbackPath=path.join(dataDir,'jobs',job.id,'readback.json');await atomic(root,readbackPath,{bookId:validated.bookId,taskId:task.id,serverSnapshotAt:startedAt,at,readback:found,comparison});let screenshotPath=null;
       if(args.capture){if(!comparison?.ok)throw new Error('只允许截图已保存且全文核对通过的题');guard();screenshotPath=path.join(dataDir,'jobs',job.id,'readback.png');await writableWorkspacePath(root,screenshotPath);await page.screenshot({path:screenshotPath,fullPage:true});guard();}
-      return {bookId:validated.bookId,taskId:task.id,status:found.status,recordId:found.recordId??null,comparison,readbackPath,screenshotPath,writePerformed:false};
+      return {bookId:validated.bookId,...readonlyIdentity(),taskId:task.id,status:found.status,recordId:found.recordId??null,comparison,readbackPath,screenshotPath,writePerformed:false};
     }
     if(action==='reconcile'){
       const task=context.manifest.tasks.find(row=>row.id===args.taskId);if(!task)throw new Error('任务不在原题单中');let pendingWrite;if(args.pendingPath)pendingWrite=JSON.parse(await fs.readFile(await existingWorkspacePath(root,args.pendingPath),'utf8'));
@@ -142,7 +192,7 @@ export async function installPersistentBridge({page,config,adapterFactory=option
         ? await recoverPreAppendSourceFailure(active,{root,dataDir,context,task,failureCommandId:args.preAppendFailureCommandId??args.preStemFailureCommandId,baselineCommandId:args.baselineProbeCommandId,pendingPath:args.pendingPath,evidencePath:path.join(dataDir,'jobs',job.id,'pre-append-recovery.json')})
         : await active.reconcile(task,{pendingWrite}),recovery=result.recovery;
       if(recovery?.writeUnlocked&&!args.historicalNetworkEvidencePath){const restored=reconcileNewSystemRun({manifest:context.manifest,state:context.state,taskId:task.id,recovery:result,baseDir:context.baseDir});await atomic(root,context.statePath,restored);}
-      return {bookId:validated.bookId,taskId:task.id,statePath:context.statePath,manifestPath:context.manifestPath,recovery,uncertain:!recovery?.writeUnlocked,writePerformed:false};
+      return {bookId:validated.bookId,...readonlyIdentity(),taskId:task.id,statePath:context.statePath,manifestPath:context.manifestPath,recovery,uncertain:!recovery?.writeUnlocked,writePerformed:false};
     }
     if(action==='complete-record-repair'){
       const task=context.manifest.tasks.find(row=>row.id===args.taskId),ref=context.manifest.correction?.beforeSnapshot;
@@ -176,7 +226,7 @@ export async function installPersistentBridge({page,config,adapterFactory=option
       const restored=reconcileNewSystemRun({manifest:context.manifest,state:context.state,taskId:task.id,recovery:result,baseDir:context.baseDir});
       restored.tasks[0].receipt=result.receipt??restored.tasks[0].receipt;
       await atomic(root,context.statePath,restored);
-      return {bookId:validated.bookId,taskId:task.id,statePath:context.statePath,manifestPath:context.manifestPath,
+      return {bookId:validated.bookId,...readonlyIdentity(),taskId:task.id,statePath:context.statePath,manifestPath:context.manifestPath,
         recovery:result.recovery,stateStatus:restored.status,uncertain:false,writePerformed:Boolean(result.receipt),eventsPath};
     }
     if(action==='execute'&&active._uncertain)throw new Error('原保存尚未核对，拒绝再次新增');
@@ -226,7 +276,7 @@ export async function installPersistentBridge({page,config,adapterFactory=option
           Object.assign(correctionState.tasks[i],{status:'completed',recordId:task.target.expectedRecordId,receipt:result.receipt,readback:result.readback,comparison:result.comparison});completed++;processed++;job.progress={completed,total:context.manifest.tasks.length};await atomic(root,context.statePath,correctionState);
         }
         correctionState.status=completed===context.manifest.tasks.length?'completed':'stopped';await atomic(root,context.statePath,correctionState);
-        return {bookId:validated.bookId,statePath:context.statePath,manifestPath:context.manifestPath,stateStatus:correctionState.status,stopReason:correctionState.status==='stopped'?(stopping?'pause':'limit'):null,counts:{completed,pending:context.manifest.tasks.length-completed},uncertain:false,writePerformed:true,correction:true,eventsPath};
+        return {bookId:validated.bookId,...readonlyIdentity(),statePath:context.statePath,manifestPath:context.manifestPath,stateStatus:correctionState.status,stopReason:correctionState.status==='stopped'?(stopping?'pause':'limit'):null,counts:{completed,pending:context.manifest.tasks.length-completed},uncertain:false,writePerformed:true,correction:true,eventsPath};
       }catch(error){
         if(correcting._uncertain||correcting.pendingWrite){active._uncertain=true;active._pendingWrite=correcting.pendingWrite;}
         throw error;
@@ -238,7 +288,7 @@ export async function installPersistentBridge({page,config,adapterFactory=option
     const originalRead=active.read,originalAppend=active.append,sections={},snapshotTimes=new Map();let verifiedReadbacks=0;
     if(action==='verify'){await prepareRuntimeDirectory(root,evidenceDir);await writableWorkspacePath(root,readbackEvidence);await fs.writeFile(readbackEvidence,'',{flag:'wx'});await atomic(root,sectionEvidence,sections);}
     active.read=async(task,options={})=>{
-      stage(action==='verify'?'verify-record':active._pendingWrite?.receipt?'saved-record-readback':'fresh-prewrite-read',task.id);const key=JSON.stringify([task.target.chapterLabel,task.target.sectionLabel]);
+      stage(action==='verify'?'verify-record':active._pendingWrite?.receipt&&active._pendingWrite.task?.id===task.id?'saved-record-readback':'fresh-prewrite-read',task.id);const key=JSON.stringify([task.target.chapterLabel,task.target.sectionLabel]);
       const refresh=action==='verify'?(!snapshotTimes.has(key)||active._directoryKey!==key||!await active._scopeMatches(task.target)):options.refresh;
       const startedAt=new Date().toISOString(),found=await originalRead.call(active,task,{...options,refresh}),at=new Date().toISOString();guard();
       if(action==='verify'){if(refresh)snapshotTimes.set(key,startedAt);await writableWorkspacePath(root,readbackEvidence);await fs.appendFile(readbackEvidence,JSON.stringify({taskId:task.id,at,serverSnapshotAt:snapshotTimes.get(key),readback:found})+'\n');sections[key]={chapterLabel:task.target.chapterLabel,sectionLabel:task.target.sectionLabel,nodeID:active._nodeID,at,serverSnapshotAt:snapshotTimes.get(key),records:copy(active._directoryRecords)};await atomic(root,sectionEvidence,sections);verifiedReadbacks++;}
@@ -247,28 +297,33 @@ export async function installPersistentBridge({page,config,adapterFactory=option
     active.append=async(task,options)=>{stage('append-ui',task.id);return originalAppend.call(active,task,options);};
     let result;try{result=await runNewSystemBatch({manifest:context.manifest,state:context.state,adapter:active,baseDir:context.baseDir,verifyOnly:action==='verify',limit,stopRequested:()=>stopping,persist:async state=>{await atomic(root,context.statePath,state);job.progress={status:state.status,completed:state.tasks.filter(row=>['completed','skipped_existing'].includes(row.status)).length,...(action==='verify'?{verifiedReadbacks}:{})};}});}finally{active.read=originalRead;active.append=originalAppend;}
     const unresolved=result.tasks.filter(row=>row.recoveryRequired&&!['completed','skipped_existing'].includes(row.status));
-    return {bookId:validated.bookId,statePath:context.statePath,manifestPath:context.manifestPath,stateStatus:result.status,stopReason:result.status==='stopped'?(stopping?'pause':'limit'):null,counts:result.tasks.reduce((all,row)=>({...all,[row.status]:(all[row.status]??0)+1}),{}),uncertain:unresolved.length>0||action==='execute'&&active._uncertain===true,pendingWrite:unresolved.length?pendingSummary(active):null,writePerformed:action==='execute',...(action==='verify'?{readbackEvidence,sectionEvidence}:{})};
+    return {bookId:validated.bookId,...readonlyIdentity(),statePath:context.statePath,manifestPath:context.manifestPath,stateStatus:result.status,stopReason:result.status==='stopped'?(stopping?'pause':'limit'):null,counts:result.tasks.reduce((all,row)=>({...all,[row.status]:(all[row.status]??0)+1}),{}),uncertain:unresolved.length>0||action==='execute'&&active._uncertain===true,pendingWrite:unresolved.length?pendingSummary(active):null,writePerformed:action==='execute',...(action==='verify'?{readbackEvidence,sectionEvidence}:{})};
   };
   const bridge={
-    status:()=>{guard();const windowBridge=page.context?.()?.browser?.()?.__textbookRecorderWindowBridge;return {bookId:validated.bookId,focusMode:validated.focusMode,windowMode:validated.windowMode,pausePersistenceSupported:true,...(normalWindowPreparation?{normalWindowPreparation:copy(normalWindowPreparation)}:{}),...(typeof windowBridge?.cleanup==='function'?{windowHelperCleanupSupported:true}:{}),continuationFence:continuationFence(),job:job?{...copy(job),adapterPhase:adapter?.pendingWrite?.phase??null}:null};},
-    cleanupWindowHelper:async()=>{guard();if(job?.running)throw new Error('任务未确认终止，不能清理窗口辅助页');const windowBridge=page.context?.()?.browser?.()?.__textbookRecorderWindowBridge;if(typeof windowBridge?.cleanup!=='function')throw new Error('当前连接没有窗口辅助页协议');const cleanup=await windowBridge.cleanup();guard();return {bookId:validated.bookId,cleanup};},
-    syncPause:control=>{guard();if(!control||control.schemaVersion!==1||Object.keys(control).some(key=>!['schemaVersion','generation','paused'].includes(key))||!Number.isSafeInteger(control.generation)||control.generation<0||typeof control.paused!=='boolean')throw new Error('持久暂停同步参数无效');pauseGeneration=Math.max(pauseGeneration,control.generation);pauseLatched ||= control.paused;if(pauseLatched)stopping=true;return {bookId:validated.bookId,continuationFence:continuationFence()};},
-    pause:(options={})=>{guard();if(Object.keys(options).some(key=>key!=='pauseGeneration')||options.pauseGeneration!==undefined&&(!Number.isSafeInteger(options.pauseGeneration)||options.pauseGeneration<1))throw new Error('暂停版本无效');stopping=true;pauseLatched=true;pauseGeneration=options.pauseGeneration===undefined?pauseGeneration+1:Math.max(pauseGeneration,options.pauseGeneration);if(job)job.stopRequested=true;return {bookId:validated.bookId,stopRequested:true,continuationFence:continuationFence()};},
+    status:()=>{guard();const windowBridge=page.context?.()?.browser?.()?.__textbookRecorderWindowBridge;return {bookId:validated.bookId,readOnly:validated.readOnly??false,...readonlyIdentity(),focusMode:validated.focusMode,windowMode:validated.windowMode,pausePersistenceSupported:true,...(normalWindowPreparation?{normalWindowPreparation:copy(normalWindowPreparation)}:{}),...(typeof windowBridge?.cleanup==='function'?{windowHelperCleanupSupported:true}:{}),continuationFence:continuationFence(),job:job?{...copy(job),adapterPhase:adapter?.pendingWrite?.phase??null}:null};},
+    cleanupWindowHelper:async()=>{guard();if(job?.running)throw new Error('任务未确认终止，不能清理窗口辅助页');const windowBridge=page.context?.()?.browser?.()?.__textbookRecorderWindowBridge;if(typeof windowBridge?.cleanup!=='function')throw new Error('当前连接没有窗口辅助页协议');const cleanup=await windowBridge.cleanup();guard();return {bookId:validated.bookId,...readonlyIdentity(),cleanup};},
+    syncPause:control=>{guard();if(!control||control.schemaVersion!==1||Object.keys(control).some(key=>!['schemaVersion','generation','paused'].includes(key))||!Number.isSafeInteger(control.generation)||control.generation<0||typeof control.paused!=='boolean')throw new Error('持久暂停同步参数无效');pauseGeneration=Math.max(pauseGeneration,control.generation);pauseLatched ||= control.paused;if(pauseLatched)stopping=true;return {bookId:validated.bookId,...readonlyIdentity(),continuationFence:continuationFence()};},
+    pause:(options={})=>{guard();if(Object.keys(options).some(key=>key!=='pauseGeneration')||options.pauseGeneration!==undefined&&(!Number.isSafeInteger(options.pauseGeneration)||options.pauseGeneration<1))throw new Error('暂停版本无效');stopping=true;pauseLatched=true;pauseGeneration=options.pauseGeneration===undefined?pauseGeneration+1:Math.max(pauseGeneration,options.pauseGeneration);if(job)job.stopRequested=true;return {bookId:validated.bookId,...readonlyIdentity(),stopRequested:true,continuationFence:continuationFence()};},
     start:({id,action,args={},continuationGuard,resumePauseGeneration})=>{
-      guard();if(typeof id!=='string'||!/^[A-Za-z0-9_-]{1,80}$/u.test(id))throw new Error('命令 ID 无效');const command=validateRecorderCommand({id,action,args,...(continuationGuard===undefined?{}:{continuationGuard})},root);if(!['probe','collect','verify','execute','readback','reconcile','complete-record-repair'].includes(action))throw new Error('该动作不可作为浏览器任务');
-      if(resumePauseGeneration!==undefined&&(action!=='execute'||continuationGuard||!Number.isSafeInteger(resumePauseGeneration)||resumePauseGeneration<0))throw new Error('普通执行的暂停恢复版本无效');
+      guard();if(typeof id!=='string'||!/^[A-Za-z0-9_-]{1,80}$/u.test(id))throw new Error('命令 ID 无效');const command=validateRecorderCommand({id,action,args,...(continuationGuard===undefined?{}:{continuationGuard})},root);if(!['probe','collect','verify','execute','readback','reconcile','complete-record-repair','draft-roundtrip','draft-roundtrip-restore'].includes(action))throw new Error('该动作不可作为浏览器任务');
+      if(validated.readOnly&&['execute','complete-record-repair','draft-roundtrip','draft-roundtrip-restore'].includes(action))throw new Error('readOnly 桥接禁止 execute、complete-record-repair 和草稿往返写动作');
+      if(['draft-roundtrip','draft-roundtrip-restore'].includes(action)&&(validated.browserBackend!=='headless'||validated.focusMode!=='background'||validated.windowMode!=='headless'))throw new Error('draft-roundtrip 只允许专用 headless 后台写入 worker');
+      if(resumePauseGeneration!==undefined&&(!['execute','draft-roundtrip','draft-roundtrip-restore'].includes(action)||continuationGuard||!Number.isSafeInteger(resumePauseGeneration)||resumePauseGeneration<0))throw new Error('普通执行的暂停恢复版本无效');
       let acceptedGuard;
       if(command.continuationGuard){
         const fence=continuationFence(),expected=command.continuationGuard,priorSafe=expected.phase==='initial'?(!job||job.terminal===true&&!job.running):job?.terminal===true&&!job.running&&job.action==='execute'&&!job.error&&!job.evidenceError&&job.result?.stateStatus==='stopped'&&job.result?.stopReason==='limit'&&job.result?.uncertain===false&&!job.result?.pendingWrite;
-        if(!priorSafe||fence.paused||fence.previousTerminalId!==expected.previousTerminalId||fence.pauseGeneration!==expected.pauseGeneration)return {bookId:validated.bookId,id,started:false,rejected:'continuation-fence',writePerformed:false,uncertain:false,continuationFence:fence};
+        if(!priorSafe||fence.paused||fence.previousTerminalId!==expected.previousTerminalId||fence.pauseGeneration!==expected.pauseGeneration)return {bookId:validated.bookId,...readonlyIdentity(),id,started:false,rejected:'continuation-fence',writePerformed:false,uncertain:false,continuationFence:fence};
         acceptedGuard={...copy(expected),bookId:validated.bookId,commandId:id};
       }
-      if(resumePauseGeneration!==undefined&&resumePauseGeneration!==pauseGeneration)return {bookId:validated.bookId,id,started:false,rejected:'pause-fence',writePerformed:false,uncertain:false,continuationFence:continuationFence()};
+      if(resumePauseGeneration!==undefined&&resumePauseGeneration!==pauseGeneration)return {bookId:validated.bookId,...readonlyIdentity(),id,started:false,rejected:'pause-fence',writePerformed:false,uncertain:false,continuationFence:continuationFence()};
       if(job?.running)throw new Error('已有任务运行');if(job?.id===id)throw new Error('命令 ID 已使用');
       const pauseResumeAccepted=resumePauseGeneration===undefined?null:{schemaVersion:1,pauseGeneration:resumePauseGeneration,bookId:validated.bookId,commandId:id};
-      stopping=false;if(action==='execute'&&!acceptedGuard)pauseLatched=false;job={id,action,running:true,terminal:false,startedAt:new Date().toISOString(),phase:null,phaseTaskId:null,phaseStartedAt:null,timings:[],progress:null,...(acceptedGuard?{continuationGuardAccepted:acceptedGuard}:{}),...(pauseResumeAccepted?{pauseResumeAccepted}:{})};
-      execute(action,args).then(result=>{job.result=result;}).catch(async error=>{job.error=clean(error);job.result={...(action==='collect'?{...error.collection,writePerformed:false}:{}),...(action==='probe'?await probeDirectoryFailure(error):{}),uncertain:action==='execute'&&(adapter?.pendingWrite?.status==='pending'||adapter?._uncertain===true),pendingWrite:pendingSummary(adapter)};}).finally(async()=>{stage('terminal');job.finishedAt=new Date().toISOString();try{await atomic(root,path.join(dataDir,'jobs',id,'job-result.json'),{...job,running:false,terminal:true});}catch(error){job.evidenceError=clean(error);job.error??=job.evidenceError;if(action==='execute')job.result={...job.result,uncertain:true,pendingWrite:pendingSummary(adapter)};}job.running=false;job.terminal=true;});
-      return {bookId:validated.bookId,id,started:true,continuationFence:continuationFence(),...(acceptedGuard?{continuationGuardAccepted:acceptedGuard}:{}),...(pauseResumeAccepted?{pauseResumeAccepted}:{})};
+      stopping=false;if(['execute','draft-roundtrip','draft-roundtrip-restore'].includes(action)&&!acceptedGuard)pauseLatched=false;job={id,action,bookId:validated.bookId,servicePid:process.pid,commandSha256:recorderCommandFingerprint(command),running:true,terminal:false,startedAt:new Date().toISOString(),phase:null,phaseTaskId:null,phaseStartedAt:null,timings:[],progress:null,...(acceptedGuard?{continuationGuardAccepted:acceptedGuard}:{}),...(pauseResumeAccepted?{pauseResumeAccepted}:{})};
+      const running=networkGuard?Promise.resolve().then(async()=>{job.readOnlyNetworkStart=await networkGuard.checkpoint();return execute(action,args);}):execute(action,args);
+      running.then(result=>{job.result=result;}).catch(async error=>{job.error=clean(error);job.result={...(action==='collect'?{...error.collection,writePerformed:false}:{}),...(action==='probe'?await probeDirectoryFailure(error):{}),
+        ...(job.draftContext?{kind:job.draftContext.kind,manifestPath:job.draftContext.manifest,manifestSha256:job.draftContext.manifestSha256,statePath:job.draftContext.state}:{}),
+        uncertain:['execute','draft-roundtrip','draft-roundtrip-restore'].includes(action)&&(adapter?.pendingWrite?.status==='pending'||adapter?._uncertain===true),pendingWrite:pendingSummary(adapter)};}).finally(async()=>{stage('terminal');job.finishedAt=new Date().toISOString();try{if(networkGuard){const end=await networkGuard.checkpoint();if(job.readOnlyNetworkStart){job.readOnlyNetwork=readonlyNetworkCommandEvidence(id,action,job.readOnlyNetworkStart,end);job.result={...job.result,readOnlyNetwork:job.readOnlyNetwork};}if(!end.allMutationAttemptsBlocked||end.evidenceError)throw new Error('只读网络屏障的阻断或证据未确认');}await atomic(root,path.join(dataDir,'jobs',id,'job-result.json'),{...job,running:false,terminal:true});}catch(error){job.evidenceError=clean(error);job.error??=job.evidenceError;if(['execute','draft-roundtrip','draft-roundtrip-restore'].includes(action))job.result={...job.result,uncertain:true,pendingWrite:pendingSummary(adapter)};}job.running=false;job.terminal=true;});
+      return {bookId:validated.bookId,...readonlyIdentity(),id,started:true,continuationFence:continuationFence(),...(acceptedGuard?{continuationGuardAccepted:acceptedGuard}:{}),...(pauseResumeAccepted?{pauseResumeAccepted}:{})};
     },
   };
   Object.defineProperty(page,'__persistentRecorder',{value:bridge});return bridge;

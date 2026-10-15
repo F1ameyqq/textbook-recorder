@@ -6,13 +6,15 @@ import { chromium } from 'playwright';
 import { renderEditorHtml, compareNewSystemReadback, verifyNewSystemSave } from './new-system-core.mjs';
 import { writeWindowsClipboardHtml } from './windows-html-clipboard.mjs';
 import { insertReviewedEditorHtml } from './browser-editor-command.mjs';
+import { readEditorLiteralDollarSafety, prepareReviewedLiteralDollarHtml, assertEditorLiteralDollarSafety } from './literal-dollar.mjs';
 import { readEditorNativeEmphasis, assertEditorNativeEmphasis } from './native-emphasis.mjs';
+import { readEditorNativeScripts, assertEditorNativeScripts } from './native-scripts.mjs';
 import { checkedPointerClick } from './checked-pointer-click.mjs';
 import { waitForAppendAutosaveReady, readAppendAutosaveSnapshot } from './append-autosave-readiness.mjs';
 import { waitVisibleByTimer } from './timer-visible-wait.mjs';
 import { captureResponseBeforeWait } from './deferred-response-wait.mjs';
 import { activateRecorderPage, validateBrowserFocusMode, validateBrowserWindowMode } from './browser-focus.mjs';
-import { requireRecorderDocumentReady } from './browser-document-state.mjs';
+import { requireRecorderDocumentReady,waitForRecorderDocumentReady } from './browser-document-state.mjs';
 import { existingWorkspacePath, writableWorkspacePath } from './recorder-config.mjs';
 import { validateHistoricalNetworkRecovery, validHistoricalNetworkRecoveryProof } from './historical-network-recovery.mjs';
 
@@ -24,7 +26,9 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const positive = value => Number.isSafeInteger(Number(value)) && Number(value) > 0;
 const label = value => String(value ?? '').replace(/\s+/gu, ' ').trim();
 const scopeKey = target => JSON.stringify([label(target.chapterLabel), label(target.sectionLabel)]);
-const exactLabel = value => new RegExp(`^\\s*${label(value).split(' ').map(part => part.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&')).join('\\s+')}\\s*$`, 'u');
+// Locator selectors parse quotes and >> before the text RegExp. Encode those
+// delimiters as literal regex escapes so appending a parent locator stays exact.
+const exactLabel = value => new RegExp(`^\\s*${label(value).split(' ').map(part => part.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&').replace(/[\/'"`>]/gu, character => '\\x' + character.charCodeAt(0).toString(16).padStart(2,'0'))).join('\\s+')}\\s*$`, 'u');
 
 function safeNumber(value) { return positive(value) ? Number(value) : undefined; }
 function parsePost(request) {
@@ -111,7 +115,8 @@ export class NewSystemAdapter {
     if (!['native-paste', 'browser-command'].includes(inputMode)) throw new Error('inputMode 必须是 native-paste 或 browser-command');
     this.focusMode = validateBrowserFocusMode(focusMode);
     this.windowMode = validateBrowserWindowMode(windowMode);
-    if (this.focusMode === 'foreground' && this.windowMode === 'minimized') throw new Error('minimized 窗口只允许 background 模式');
+    if (this.focusMode === 'foreground' && this.windowMode !== 'normal') throw new Error('minimized/headless 只允许 background 模式');
+    if (this.windowMode === 'headless' && !page) throw new Error('headless 适配器必须使用独立持久服务已绑定的页面');
     if (this.focusMode === 'background' && inputMode !== 'browser-command') throw new Error('后台模式只支持 browser-command；原生剪贴板粘贴须使用 foreground');
     if (!Number.isSafeInteger(directoryTimeout) || directoryTimeout < 1 || directoryTimeout > 120000) throw new Error('directoryTimeout 必须是 1–120000 毫秒的整数');
     if (!Number.isSafeInteger(directoryRootTimeout) || directoryRootTimeout < 1 || directoryRootTimeout > 120000) throw new Error('directoryRootTimeout 必须是 1–120000 毫秒的整数');
@@ -262,16 +267,42 @@ export class NewSystemAdapter {
       const norm = text => String(text ?? '').replace(/\s+/gu, ' ').trim();
       const node = document.querySelector('.el-tree-node.is-current');
       const section = node?.querySelector(':scope > .el-tree-node__content');
-      const parent = node?.parentElement?.closest('.el-tree-node');
-      const chapter = parent?.querySelector(':scope > .el-tree-node__content');
+      const ancestors = [];
+      for (let parent = node?.parentElement?.closest('.el-tree-node'); parent; parent = parent.parentElement?.closest('.el-tree-node')) {
+        ancestors.unshift(norm(parent.querySelector(':scope > .el-tree-node__content')?.innerText));
+      }
       const sectionLabel = norm(section?.innerText);
-      return { chapterLabel: chapter ? norm(chapter.innerText) : sectionLabel, sectionLabel };
+      return { chapterLabel: ancestors.length ? ancestors.join(' > ') : sectionLabel, sectionLabel };
     });
   }
 
   async _scopeMatches(target) {
     const selected = await this._selectedScope();
     return selected.chapterLabel === label(target.chapterLabel) && selected.sectionLabel === label(target.sectionLabel);
+  }
+
+  /** A breadcrumb is a path of separately named nodes, never one DOM label.
+   * Keep flat scope matching compatible; explicit paths start at a tree root
+   * and use immediate children, so repeated middle labels remain isolated. */
+  async _directoryNode(chapterLabel, { budget = () => this.directoryTimeout } = {}) {
+    const parts = String(chapterLabel).split(' > ').map(label);
+    if (!parts.length || parts.length > 8 || parts.some(part => !part)) throw new Error('目录路径为空或超过支持深度');
+    let node, content;
+    for (const [index, part] of parts.entries()) {
+      const candidates = index === 0
+        ? this.page.locator(parts.length === 1 ? '.el-tree-node__content' : '.el-tree > .el-tree-node > .el-tree-node__content')
+        : node.locator(':scope > .el-tree-node__children > .el-tree-node > .el-tree-node__content');
+      content = candidates.filter({hasText:exactLabel(part)});
+      const name = (parts.length === 1 ? '章节 ' : '目录路径 ') + parts.slice(0,index+1).join(' > ');
+      await waitVisibleByTimer(content,{timeout:budget(name,'directory-chapter'),name,targetRole:'directory-chapter'});
+      if (await content.count() !== 1) throw new Error('目录路径标签无法唯一匹配');
+      node = content.locator('xpath=..');
+      if (index < parts.length - 1) {
+        const expanded = await node.evaluate(element => element.classList.contains('is-expanded') || element.getAttribute('aria-expanded') === 'true');
+        if (!expanded) await this._click(content);
+      }
+    }
+    return {node,content};
   }
 
   async _activate() {
@@ -339,6 +370,21 @@ export class NewSystemAdapter {
     // identity first; editor visibility becomes required after scope selection.
     await this.guard({ waitForEditors: false });
     await this._activate();
+    // Reject a hidden or wrongly bound background document before spending the
+    // directory-loading budget. A fresh committed navigation may still load;
+    // readiness and chapter/section waits share the original directory budget.
+    const directoryDeadline=Date.now()+this.directoryTimeout;
+    if(this.focusMode==='background'){
+      try{await waitForRecorderDocumentReady(this.page,{focusMode:this.focusMode,windowMode:this.windowMode,
+        timeoutMs:Math.min(this.timeout,this.directoryTimeout),guard:()=>this.guard({waitForEditors:false})});}
+      catch(error){error.message='目录读取前: '+error.message;throw error;}
+    }
+    const directoryBudget=(name,targetRole)=>{
+      if(this.focusMode!=='background')return this.directoryTimeout;
+      const remaining=directoryDeadline-Date.now();if(remaining>0)return remaining;
+      const error=new Error(name+'在时限内未显示，停止操作');error.code='TARGET_VISIBILITY_TIMEOUT';error.targetRole=targetRole;
+      error.visibilityDiagnostic={name,targetRole,timeout:this.directoryTimeout,budgetExhausted:true,lastState:null};throw error;
+    };
     if (this._directoryKey === scopeKey(target) && await this._scopeMatches(target)) {
       await this._stableList(this._directoryRecords);
       await this.guard();
@@ -351,12 +397,7 @@ export class NewSystemAdapter {
       await this._reloadForFreshRead();
       if (await this._scopeMatches(target)) throw new Error('刷新后目录仍已选中且无可信列表，拒绝等待不存在的列表请求');
     }
-    const chapter = this.page.locator('.el-tree-node__content').filter({ hasText: exactLabel(target.chapterLabel) });
-    // The directory tree itself loads asynchronously after reload. An immediate
-    // count of zero is not evidence that the chapter is absent.
-    await waitVisibleByTimer(chapter,{timeout:this.directoryTimeout,name:'章节 '+target.chapterLabel,targetRole:'directory-chapter'});
-    if (await chapter.count() !== 1) throw new Error('章节标签无法唯一匹配');
-    const chapterNode = chapter.locator('xpath=..');
+    const {node:chapterNode,content:chapter} = await this._directoryNode(target.chapterLabel,{budget:directoryBudget});
     const rootLeaf = label(target.chapterLabel) === label(target.sectionLabel) && await chapterNode.evaluate(node => !node.querySelector(':scope > .el-tree-node__children > .el-tree-node') && Boolean(node.querySelector(':scope > .el-tree-node__content .el-tree-node__expand-icon.is-leaf')));
     const section = rootLeaf ? chapter : chapterNode.locator('.el-tree-node__content').filter({ hasText: exactLabel(target.sectionLabel) });
     const expanded = await chapterNode.evaluate(node => {
@@ -367,7 +408,7 @@ export class NewSystemAdapter {
     // Missing section labels may still be loading inside an already expanded node.
     // Toggle only a visibly collapsed chapter, otherwise wait for the child label.
     if (!rootLeaf && !expanded) await this._click(chapter);
-    await waitVisibleByTimer(section,{timeout:this.directoryTimeout,name:'节目录 '+target.sectionLabel,targetRole:'directory-section'});
+    await waitVisibleByTimer(section,{timeout:directoryBudget('节目录 '+target.sectionLabel,'directory-section'),name:'节目录 '+target.sectionLabel,targetRole:'directory-section'});
     if (await section.count() !== 1) throw new Error('该章节下的节标签无法唯一匹配');
     const cursor = this._sequence;
     const observedList = captureResponseBeforeWait(this.page, {predicate:response => {
@@ -586,7 +627,9 @@ export class NewSystemAdapter {
       };
     });
     const native = await this.page.locator(selector).evaluate(readEditorNativeEmphasis);
-    result.paragraphs.forEach((paragraph,index)=>{paragraph.nativeEmphasis=native[index];});
+    const scripts = await this.page.locator(selector).evaluate(readEditorNativeScripts);
+    result.literalDollarSafety = await this.page.locator(selector).evaluate(readEditorLiteralDollarSafety);
+    result.paragraphs.forEach((paragraph,index)=>{paragraph.nativeEmphasis=native[index];paragraph.nativeScripts=scripts[index];});
     for (const image of result.images) image.sha256 = await this._hashImage(image.src);
     return result;
   }
@@ -847,6 +890,15 @@ export class NewSystemAdapter {
     } catch { throw new Error('正常剪贴板写入预检失败，尚未新增题目'); }
   }
 
+  async _assertLiteralDollarEditors({stemHtml,answerHtml}) {
+    if (this.inputMode !== 'browser-command') return;
+    for (const [selector,html] of [['#contentedit .w-e-text',stemHtml],['#answeredit .w-e-text',answerHtml]]) {
+      if (typeof html !== 'string' || !html.includes('$')) continue;
+      const expected = await this.page.evaluate(prepareReviewedLiteralDollarHtml,html);
+      await assertEditorLiteralDollarSafety(this.page,selector,expected);
+    }
+  }
+
   async _paste(selector, html, { replace = false } = {}) {
     if (this.inputMode === 'browser-command') {
       await this.guard();
@@ -879,6 +931,7 @@ export class NewSystemAdapter {
       return clean(actual.textContent) === clean(expected.textContent) && actual.querySelectorAll('img').length === expected.querySelectorAll('img').length;
     }, { selector, html }, { timeout: this.timeout, polling:80 });
     await assertEditorNativeEmphasis(this.page,selector,html);
+    await assertEditorNativeScripts(this.page,selector,html);
   }
 
   /** Reviewed answer content with the platform's own Add Analysis menu. */
@@ -929,6 +982,7 @@ export class NewSystemAdapter {
       });
     },{selector,html:expected},{timeout:this.timeout,polling:80});
     await assertEditorNativeEmphasis(this.page,selector,expected);
+    await assertEditorNativeScripts(this.page,selector,expected);
     return {analysisButtonClicks:1};
   }
 
@@ -963,7 +1017,7 @@ export class NewSystemAdapter {
         edited = true;
         const formatInput=await this._pasteReviewedAnswer(task.answer,{replace:true});
         await checkpoint({phase:'answer-format-input',...formatInput});
-        await this._click(this.page.locator('input.el-input__inner').nth(0));
+        await this._click(this.page.locator('input.el-input__inner').nth(0),{beforeInput:()=>this._assertLiteralDollarEditors({answerHtml:html})});
         phase = 'answer-save-business-receipt';
         const response=await saveResponse.wait();
         if (saves.length !== 1 || saves[0] !== response.request()) throw new Error('答案修正的保存次数与预期不符');
@@ -1088,11 +1142,13 @@ export class NewSystemAdapter {
             const error=new Error('保存按钮点击之前模型、已审内容或页面绑定改变，保留写入锁');
             error.appendModelReadiness={lastSnapshot:snapshot,windowCheck:modelReadiness.windowCheck};throw error;
           }
+          await this._assertLiteralDollarEditors({stemHtml,answerHtml});
+          requireNoEarlierSave();
         }});
         freshPending.saveTrigger=structuredClone(saveTrigger);
       }else{
         phase = 'save-business-receipt';
-        saveTrigger=await this._click(this.page.locator('input.el-input__inner').nth(0));
+        saveTrigger=await this._click(this.page.locator('input.el-input__inner').nth(0),{beforeInput:()=>this._assertLiteralDollarEditors({stemHtml,answerHtml})});
       }
       const response = await saveResponse.wait();
       const requestBody = parsePost(response.request());
