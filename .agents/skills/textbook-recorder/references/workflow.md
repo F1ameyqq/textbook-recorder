@@ -50,13 +50,15 @@ npm run recorder:probe -- data/jobs/job-01/probe.args.json --wait --summary
 
 ## OCR 和原图阅读
 
-Python 是裁图和 CPU OCR 的可选依赖。需要时按[快速开始](../../../../docs/quickstart.md)在本仓库的 `.venv-workflow` 中配置，不改全局 Python；脚本包装优先使用 `TEXTBOOK_RECORDER_PYTHON` 或项目 `.venv-workflow` / `.venv-ocr`，最后回退到 `python`。若当前环境已有本脚本支持的 Python/PaddleOCR CPU 依赖，可先检查选页与来源哈希：
+Python 是裁图和本机 OCR 的可选依赖。按[快速开始](../../../../docs/quickstart.md)分别准备裁图与 GPU OCR 环境，不改全局 Python。OCR 保留 PP-OCRv5 mobile，默认 `gpu:0`、2 个 CPU 线程和低优先级；没有可用 GPU 或 GPU 推理依赖时明确失败，不静默回退 CPU。需要 CPU 时必须显式传 `--device cpu`，CPU 专用的 `requirements-ocr.txt` 仍可使用。
+
+`workflow:ocr` 按 `TEXTBOOK_RECORDER_OCR_PYTHON` → `TEXTBOOK_RECORDER_PYTHON` → `config/python.local.json` 的 `ocrPython` → `.venv-ocr-gpu` → `.venv-workflow` → `.venv-ocr` → `python` 选择解释器。两个环境变量未显式设置时才读取本地配置；配置严格为 `{ "schemaVersion": 1, "ocrPython": "已存在解释器的绝对路径" }`，可指向已验证环境而不复制或移动它。裁图仍按 `TEXTBOOK_RECORDER_PYTHON`、`.venv-workflow` / `.venv-ocr`、`python` 的原优先级运行，完全不读取 OCR 配置。先检查明确选页与来源哈希：
 
 ```powershell
 npm run workflow:ocr -- --index=data/jobs/job-01/index.json --pages=1-10 --dry-run
 ```
 
-实际 OCR 使用同一命令去掉 `--dry-run`，首次运行可能下载模型。也可用项目环境的 Python 直接调用 `scripts/ocr-pages.py`，`--index`/`--pages` 接口相同。明确选择正文及答案页；不把未授权全书自动加进范围，不自动切换模型来源或声称 OCR 已完成配题；没有 OCR 环境时可直接逐图阅读。OCR 的 raw/clean 文本、框位置、图像哈希均保留，清洗结果不能作为原书空格、公式或阅读顺序的证明。新电脑的 OCR 模型运行仍需实际验证，dry-run 只检查来源和选页。
+实际 GPU OCR 使用同一命令去掉 `--dry-run`；明确改用 CPU 时追加 `--device cpu`，解释器选择与设备选择分别生效。首次运行可能下载模型。也可用已配置环境的 Python 直接调用 `scripts/ocr-pages.py`，`--index`/`--pages` 接口相同。明确选择正文及答案页；不把未授权全书自动加进范围，不自动切换模型来源或声称 OCR 已完成配题；没有 OCR 环境时可直接逐图阅读。OCR 的 raw/clean 文本、框位置、图像哈希均保留，清洗结果不能作为原书空格、公式或阅读顺序的证明。新电脑的 OCR 模型运行仍需实际验证，dry-run 只检查来源和选页，不构成 GPU 或线上验收。
 
 先读原页，再用 OCR 辅助定位。按栏目、双栏、跨页关系建立逐页 candidate 清单。检查无编号填空/知识框图、具体开放问题和完整实践题。正文题号、组别和节标识不足以唯一配答时用明确 ID 配对；不能只用一个数字找答案。原文和参考答案有疑点就保留说明，不用常识纠正。
 

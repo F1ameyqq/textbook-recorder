@@ -28,3 +28,15 @@ test('runtime files stay local while the shared source remains inspectable', asy
   await fs.writeFile(path.join(root, 'README.md'), '# Example');
   assert.deepEqual(await listShareFiles(root), ['README.md', 'config/recorder.example.json']);
 });
+
+
+test('worktree .git metadata is skipped during enumeration but never shareable', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'share-worktree-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  await fs.writeFile(path.join(root, '.git'), 'gitdir: /synthetic/worktree-metadata');
+  await fs.writeFile(path.join(root, 'README.md'), '# Synthetic worktree');
+  assert.deepEqual(await listShareFiles(root), ['README.md']);
+  const report = await inspectShareFiles(root, ['.git']);
+  assert.equal(report.valid, false);
+  assert.equal(report.errors.length, 1);
+});

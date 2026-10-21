@@ -47,8 +47,10 @@ description: 在本仓库用 agent 读教材原图、确定整题和参考答案
 
 浏览器回读报 `hidden` 或状态等待超时后，按[恢复说明](../../../docs/recovery.md)核对同一命令的终止证据；`writePerformed` 和阶段名称不能单独证明实际保存。初始回读失败即使由程序确认未进入 append，仍须刷新原目录、核对失败前完整基线，再用原题单和原进度单题恢复。保留真实可见性要求，不切换窗口模式或降低回读标准来通过。
 
-本地 CLI 不调用云端大模型 API；CPU OCR 使用本机识别模型，agent 读图、分题和答案判断仍使用其额度。没有可用读图能力时停在待审阶段，不能仅凭 OCR 填写检查通过。
+本地 CLI 不调用云端大模型 API；OCR 默认使用本机 GPU 识别模型，CPU 须显式选择，agent 读图、分题和答案判断仍使用其额度。没有可用读图能力时停在待审阶段，不能仅凭 OCR 填写检查通过。
 
 节省额度应靠 CLI 内部等待、状态摘要和复用已经实际看过的同 hash、同 bbox 原图。修订用 `workflow:diff` 定向定位受影响的完整题；来源、范围或配对变化需重新核对。仍须实际审校当前内容与覆盖，形成绑定新草稿 hash 的批准决定，不能自动继承旧批准或用缓存替代未做的审校。
 
 准备阶段按[本地工作流工具](../../../docs/workflow-tools.md)使用 `workflow:mapping` 机械填写已确认题序和起点、`workflow:conflicts` 集中定位配答候选、`workflow:materials` 按完整题或当前版本差异读取定向材料。mapping 骨架的作答要求与审校结论须实际补全；首次逐页覆盖仍检查全部原页。报告及来源引用不授予批准，不能以定向子集代替完整题单审校。
+
+准备阶段可使用 `workflow:prepare`、`workflow:patch` 和 `workflow:incident`；见[离线准备与局部修订](../../../docs/local-preparation.md)。文本纠错已选用 MAX 强度和 v2 提示词，见[参考配置](../../../docs/ocr-correction/README.md)。此配置尚未接入 CLI，不自动发起云端请求；模型结果仅作为候选，原图审校及 hash-bound 批准要求继续保留。

@@ -26,6 +26,8 @@ export async function listShareFiles(root) {
         if (entry.name === '__pycache__') continue;
         await visit(path.join(directory, entry.name), relative);
       } else if (entry.isFile()) {
+        // Git worktrees use a .git pointer file instead of a metadata directory.
+        if (!prefix && entry.name === '.git') continue;
         if (!prefix && !allowedTop.has(entry.name)) throw new Error(`发布范围外的文件：${relative}`);
         if (relative.startsWith('config/') && relative !== 'config/recorder.example.json') continue;
         if (sensitiveNames.test(entry.name) && entry.name !== 'package-lock.json') throw new Error(`本地运行文件不可发布：${relative}`);

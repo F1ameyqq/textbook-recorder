@@ -38,6 +38,10 @@
     "workflow:decisions": "node scripts/create-review-decisions.mjs",
     "workflow:diff": "node scripts/review-diff.mjs",
     "workflow:job": "node scripts/workflow-job.mjs",
+    "workflow:prepare": "node scripts/prepare-local-workflow.mjs",
+    "workflow:patch": "node scripts/patch-preparation.mjs",
+    "workflow:incident": "node scripts/create-incident-packet.mjs",
+    "test:preparation": "node --test --test-concurrency=1 tests/local-preparation.test.mjs tests/local-preparation-patch.test.mjs tests/local-incident-packet.test.mjs tests/local-preparation-integration.test.mjs tests/preparation-pipeline.test.mjs tests/mapping-template.test.mjs tests/pairing-conflicts.test.mjs tests/review-materials.test.mjs tests/review-decisions-template.test.mjs tests/review-diff.test.mjs tests/workflow-job.test.mjs",
     "workflow:approve": "node scripts/approve-reviewed-draft.mjs"
   },
   "dependencies": {

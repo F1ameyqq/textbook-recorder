@@ -2,11 +2,15 @@
 
 让朋友的 agent 在仓库中完成原页采集、读图分题、答案配对、题单审校和指定范围的追加录入。CLI 负责机械步骤：保留来源与哈希、生成待审草稿、检查批准决定，以及逐题核对保存回执和刷新回读。遇到差异或保存结果未知就停止。
 
-题目拆分、答案对应和原书覆盖由 agent 对照原图判断，也可以人工复核。本地脚本不调用云端大模型 API；CPU OCR 在本机运行识别模型，agent 读图和判断仍消耗其额度。本项目提供 agent 辅助的完整操作流程；采集及新书、新电脑的安装到录入流程仍需实际验收，不能据此承诺零额度、全自动或无人值守完成整本书。
+题目拆分、答案对应和原书覆盖由 agent 对照原图判断，也可以人工复核。本地脚本不调用云端大模型 API；OCR 在本机运行识别模型，agent 读图和判断仍消耗其额度。本项目提供 agent 辅助的完整操作流程；采集及新书、新电脑的安装到录入流程仍需实际验收，不能据此承诺零额度、全自动或无人值守完成整本书。
 
 本地准备可用 `workflow:mapping` 从已确认题序和目录基线生成待填写骨架，`workflow:conflicts` 集中显示配答问题与候选，`workflow:materials` 为指定完整题或修订差异生成定向原图材料包。三项都只处理明确提供的本地材料，保留待审状态；接口见[本地工作流工具](docs/workflow-tools.md)。
 
 独立运行时还提供多书 fleet、每书专用无头浏览器、本地状态快照和阶段耗时诊断。默认扩展模式保持兼容，运行中的录入不会自动切换。配置、并行隔离及平台验收边界见[独立运行时](docs/runtime-isolation.md)。
+
+独立副本新增 `workflow:prepare` 统一准备、`workflow:patch` 局部修改、`workflow:incident` 精简异常包。均只处理明确的本地文件，保留原始输入并输出新版本，停在待补材料或待审阶段；使用说明见[离线准备与局部修订](docs/local-preparation.md)。
+
+文本纠错方案已选用 DeepSeek Flash 的 MAX 推理强度与 v2 提示词，参考配置和使用边界见 [OCR 纠错配置](docs/ocr-correction/README.md)，同批 50 题的原图审校结果见 [实验摘要](docs/ocr-correction-results.md)。这些材料用于准备候选，当前 CLI 尚未接入云端纠错，也不会自动切换运行中的任务。
 
 ## 让 agent 使用 skill
 
@@ -45,7 +49,7 @@ skill 依赖本仓库程序和参考文件；单独复制 `SKILL.md` 不构成�
 
 需要 Node.js 22 或更高版本、Windows、Edge、已登录的目标录入页面及 [Playwright 浏览器扩展](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm)（[官方安装说明](https://github.com/microsoft/playwright/blob/main/packages/extension/README.md)）。项目固定使用 `@playwright/mcp@0.0.83`；通过锁文件安装依赖。
 
-裁图和可选 CPU OCR 使用 Python，建议 Python 3.11 的项目 `.venv-workflow`；依赖按仓库 `requirements-crop.txt` 或 `requirements-ocr.txt` 安装。初始化方式见[快速开始](docs/quickstart.md)。不用 OCR 也须用 agent 实际读图完成审校。
+裁图和可选本机 OCR 使用 Python，建议 Python 3.11。裁图使用 `.venv-workflow` 与 `requirements-crop.txt`；OCR 保留 PP-OCRv5 mobile，默认 `--device gpu:0`、2 线程和低优先级，GPU 环境按官方安装选择器配置。没有可用 GPU 时明确失败；使用 CPU 必须显式传 `--device cpu`，CPU 专用 `requirements-ocr.txt` 继续保留。`workflow:ocr` 可通过 `TEXTBOOK_RECORDER_OCR_PYTHON` 或忽略于 Git 的 `config/python.local.json` 指向已有 GPU Python，完整优先级与安装说明见[快速开始](docs/quickstart.md)。安装或其他电脑的有限测试不代表新电脑验收，原图审校标准不变。
 
 先接受私有仓库邀请，再从仓库页克隆或选择 **Code → Download ZIP**，解压后进入项目目录。克隆地址为 `https://github.com/F1ameyqq/textbook-recorder.git`，访问需要自己的受邀 GitHub 账号。
 
@@ -127,6 +131,8 @@ npm run recorder:execute -- --manifest=data/jobs/job-01/batch.approved.json --st
 读图、转录、配对和审校阶段可复用同一 job 已实际看过且 hash、bbox 相同的原图；修订按 `workflow:diff` 定向定位受影响的完整题和来源区域。来源或范围变化仍需重新看图。当前内容与覆盖要实际核对，并为新草稿形成 hash-bound 批准；缓存和旧批准不能替代未完成的审校。
 
 ## 开发验证与仓库内容
+
+本轮改动范围与验证结果见[准备工具、GPU OCR 与 MAX 发布记录](docs/release-preparation-gpu-max.md)。
 
 ```powershell
 npm test

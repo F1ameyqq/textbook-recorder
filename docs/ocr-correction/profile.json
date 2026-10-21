@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "profileId": "ocr-correction-max-v2",
+  "materialType": "reference-profile",
+  "selectionStatus": "USER_SELECTED",
+  "integrationStatus": "NOT_CONNECTED_TO_RUNNING_TASKS",
+  "model": "deepseek-flash",
+  "thinking": {
+    "type": "enabled"
+  },
+  "reasoning_effort": "max",
+  "max_tokens": 65536,
+  "systemPromptFile": "system-v2.txt",
+  "systemPromptSha256": "057269e3244acea8c2c18060a814e5bdb902c6f96049217ffb58bc316a684fb3",
+  "inputContract": {
+    "questionsPerBatch": 25,
+    "requiredTopLevelFields": ["pages", "questions"],
+    "imagesIncluded": false,
+    "humanTruthOrPriorModelOutputsIncluded": false
+  },
+  "outputContract": {
+    "topLevelField": "decisions",
+    "requiredDecisionFields": ["id", "action", "candidateText", "needsImage", "reason"]
+  },
+  "executionNotes": {
+    "testedTimeoutSeconds": 600,
+    "automaticRetries": 0,
+    "unknownOutcomeRequiresExplicitResendAuthorization": true
+  }
+}

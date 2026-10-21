@@ -34,20 +34,44 @@ npm run demo
 
 首次 `doctor` 显示配置或令牌待配置是正常提示；完成下一步后再运行。
 
-裁图需要 Python/Pillow；CPU OCR 是可选辅助。需要这些步骤时，建议安装 Python 3.11，并在项目中配置独立环境：
+裁图需要 Python/Pillow；OCR 是可选的本机辅助。需要时使用 Python 3.11 的独立环境，不修改全局 Python。先安装裁图依赖：
 
 ```powershell
 py -3.11 -m venv .venv-workflow
 .venv-workflow\Scripts\python.exe -m pip install -r requirements-crop.txt
 ```
 
-仅在需要 CPU OCR 时再安装 `requirements-ocr.txt`：
+OCR 默认保留 PP-OCRv5 mobile 模型并使用 `gpu:0`、2 个 CPU 线程和低优先级。GPU OCR 建议使用单独环境：
+
+```powershell
+py -3.11 -m venv .venv-ocr-gpu
+```
+
+按 [PaddlePaddle 官方安装选择器](https://www.paddlepaddle.org.cn/install/quick)选择本机 Windows、GPU 与匹配的 CUDA 构建，将其安装命令中的 `python` 换成 `.venv-ocr-gpu\Scripts\python.exe`。然后在同一环境安装项目使用的 OCR 包；能力与推理引擎的安装说明见 [PaddleOCR 官方文档](https://www.paddleocr.ai/latest/en/version3.x/installation.html)：
+
+```powershell
+.venv-ocr-gpu\Scripts\python.exe -m pip install "paddleocr==3.7.0" "Pillow==12.1.0"
+```
+
+已有经过验证的 GPU Python 时可直接指向它，无需移动或复制环境。`config/python.local.json` 仅允许下面两个字段，将示例改成该解释器的真实绝对路径；此文件已由 `config/*.local.json` 忽略，不提交到仓库：
+
+```json
+{
+  "schemaVersion": 1,
+  "ocrPython": "C:\\path\\to\\gpu-env\\Scripts\\python.exe"
+}
+```
+
+OCR 解释器按 `TEXTBOOK_RECORDER_OCR_PYTHON` → `TEXTBOOK_RECORDER_PYTHON` → `config/python.local.json` 的 `ocrPython` → `.venv-ocr-gpu` → `.venv-workflow` → `.venv-ocr` → `python` 选择。两个环境变量都未显式设置时才读取本地 OCR 配置；被选中的显式路径必须是存在的可执行文件，错误配置直接报错。裁图保持原规则：`TEXTBOOK_RECORDER_PYTHON` → `.venv-workflow` → `.venv-ocr` → `python`，不读取 OCR 环境变量或 OCR 本地配置。
+
+包装器只选择解释器，不改变设备参数。没有可用 GPU、GPU 版 Paddle 或对应驱动时，默认 OCR 明确失败，不会静默改用 CPU。需要 CPU OCR 时，保留使用原有 CPU 专用依赖，并在实际命令中显式选择 CPU；不要把 CPU 专用的 `requirements-ocr.txt` 安装到 GPU 环境：
 
 ```powershell
 .venv-workflow\Scripts\python.exe -m pip install -r requirements-ocr.txt
+npm run workflow:ocr -- --index=data/jobs/job-01/index.json --pages=1-10 --device cpu
 ```
 
-仓库 Python 包装优先使用 `TEXTBOOK_RECORDER_PYTHON`，再查找 `.venv-workflow` / `.venv-ocr`，最后回退到 `python`。OCR 首次可能下载模型；新电脑实际模型运行未作为本版线上验收，`--dry-run` 只验证索引、哈希及选页，不做识别。不要复制朋友的环境目录或把全局 Python 改成项目环境。
+OCR 首次可能下载模型；新电脑仍需实际验证所选解释器、依赖和模型运行，安装说明与其他电脑的有限样本结果不构成本机验收。`--dry-run` 只验证索引、哈希及选页，不做识别或 GPU 验收。OCR 输出仍需原图审校，不自动完成分题、覆盖或答案判断。
 
 ## 2. 本地书籍与扩展配置
 
@@ -115,7 +139,7 @@ data/jobs/job-01/progress.json
 
 `npm run demo` 生成 `data/demo/batch.json`、合成配图和 `data/demo/preview.html`；`examples/batch.example.json` 也是合成 `fixture` 样例。可以查看它们学习字段，但不能只改书号和 `source` 就提交真实平台。自己的生产题单应从独立覆盖清单与原书材料准备。
 
-采集使用 `node scripts/recorder-control.mjs collect <本地参数.json> --wait --summary`，明确 `from`、`to` 及 `output: "data/jobs/job-01"`，输出原页图和索引。它是只读操作，要求两编辑器原本为空；必须在会选题的单节 probe、readback、verify 之前完成，不能清空旧题来获得入口。采集通路尚需新书线上验收。CPU OCR 可按明确 index/pages 辅助，不能替代看原图。参数及完整命令见[工作流](../.agents/skills/textbook-recorder/references/workflow.md)。
+采集使用 `node scripts/recorder-control.mjs collect <本地参数.json> --wait --summary`，明确 `from`、`to` 及 `output: "data/jobs/job-01"`，输出原页图和索引。它是只读操作，要求两编辑器原本为空；必须在会选题的单节 probe、readback、verify 之前完成，不能清空旧题来获得入口。采集通路尚需新书线上验收。本机 OCR 可按明确 index/pages 辅助，默认 GPU，不能替代看原图。参数及完整命令见[工作流](../.agents/skills/textbook-recorder/references/workflow.md)。
 
 普通 `npm run recorder:probe -- --wait --summary` 仅确认书号/连接，`recordCount: null` 不能作为目录基线。采集完成后，为目标节保存 `probe.args.json`，填写实际 `chapterLabel`、`sectionLabel` 和 `exportRecords: true`，再运行：
 
